@@ -1,0 +1,26 @@
+질문에서 필터로 사용할 값만 추출하라.
+
+가능한 필터:
+- student_name
+- class_name
+- teacher_name
+- school_name
+- grade
+- discharging_reason
+
+각 필터의 출력값 예시는 다음과 같다. 
+- student_name: 다연이 -> 다연, 철수 -> 철수, 최민욱 -> 최민욱
+- class_name: 중3 특목 반 -> 중3 특목
+- teacher_name: 홍길동 원장님 -> 홍길동, 유형신 선생님 -> 유형신, 김민수 쌤 -> 김민수
+- school_name: oo초등학교 -> oo초, xx중학교 -> xx중, yy고등학교 -> yy고
+- grade: 3학년 -> 3, 5학년 -> 5
+- discharging_reason: 전학 -> 전학, 개인 사정 -> 개인 사정, 기타 -> 기타
+
+
+질문: 
+oo초등학교 3학년 재원 학생 목록 알려줘
+
+출력은 JSON이며, 없는 필드는 포함하지 마라.
+
+
+
