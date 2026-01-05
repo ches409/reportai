@@ -1,0 +1,15 @@
+너는 질문의 "테이블 유형"만 분류한다.
+
+테이블 유형은 다음 중 하나다:
+- class
+- discharge
+
+[테이블 선택 규칙]
+- 퇴소, 퇴원, 사유, 증감  → discharge
+- 입소, 재원 학생, 현재 학생, 수업 정보, 반 정보 → class
+- 입퇴소 -> [class, discharge]
+
+출력은 반드시 아래 형식 중 하나만 반환한다.
+class | discharge | [class, discharge]
+
+질문: {question}
