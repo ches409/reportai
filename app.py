@@ -3156,24 +3156,37 @@ class ReportOrchestrator:
 
 ####
 
+@dataclass
+class DataImportRequest:
+    """데이터 입력 요청"""
+    table_type: str
+    dataframe: pd.DataFrame
+    id: str = field(default_factory=lambda: f"data_import_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}")
+    _is_data_import: bool = True
+    _retry_count: int = 0
+
 class PollingSystem:
     def __init__(self):
         self.orchestrator = ReportOrchestrator()
         self.is_running = False
-        self.queue = asyncio.Queue()
+        self.queue = asyncio.PriorityQueue()  # 우선순위 큐로 변경
         self.processed_ids = set()  # 처리 중이거나 완료된 요청 ID 추적
         self.worker_tasks = []  # 여러 워커 태스크 저장
         self.polling_task = None
+        self.is_processing_report = False  # 보고서 생성 중 플래그
+        self.report_lock = asyncio.Lock()  # 보고서 생성 락
+        self._queue_order = 0  # 큐에 추가된 순서 (우선순위가 같을 때 비교용)
     
     async def _worker(self):
-        """큐에서 요청을 하나씩 꺼내서 처리하는 워커"""
+        """큐에서 요청을 하나씩 꺼내서 처리하는 워커 (우선순위 기반)"""
         logger.info("👷 워커 시작")
         while self.is_running:
             request = None
+            priority = None
             try:
-                # 큐에서 요청 가져오기 (타임아웃 1초)
+                # 큐에서 요청 가져오기 (타임아웃 1초, 우선순위 큐)
                 try:
-                    request = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                    priority, order, request = await asyncio.wait_for(self.queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
                     continue
                 
@@ -3186,13 +3199,35 @@ class PollingSystem:
                     self.queue.task_done()
                     continue
                 
-                logger.info(f"📝 큐에서 요청 가져옴: {request.id} (큐 크기: {self.queue.qsize()})")
+                # 데이터 입력 작업인 경우 보고서 생성이 끝날 때까지 대기
+                is_data_import = getattr(request, '_is_data_import', False)
+                if is_data_import and self.is_processing_report:
+                    logger.info(f"⏳ 데이터 입력 대기 중: 보고서 생성 완료 대기... (요청 ID: {request.id})")
+                    # 보고서 생성이 끝날 때까지 대기
+                    while self.is_processing_report and self.is_running:
+                        await asyncio.sleep(0.5)
+                    logger.info(f"✅ 데이터 입력 시작: 보고서 생성 완료됨 (요청 ID: {request.id})")
+                
+                logger.info(f"📝 큐에서 요청 가져옴: {request.id} (우선순위: {priority}, 큐 크기: {self.queue.qsize()})")
                 
                 # 처리 시도
                 try:
                     # 처리 시작 시 processed_ids에 추가 (중복 처리 방지)
                     self.processed_ids.add(request.id)
-                    await self.orchestrator.process_request(request)
+                    
+                    # 보고서 생성 작업인 경우 플래그 설정
+                    if not is_data_import:
+                        async with self.report_lock:
+                            self.is_processing_report = True
+                            logger.info(f"📊 보고서 생성 시작: {request.id}")
+                    
+                    # 데이터 입력 작업 처리
+                    if is_data_import:
+                        await self._process_data_import(request)
+                    else:
+                        # 보고서 생성 작업 처리
+                        await self.orchestrator.process_request(request)
+                    
                     logger.info(f"✅ 요청 처리 완료: {request.id}")
                 except Exception as e:
                     logger.error(f"❌ 요청 처리 실패: {request.id}, 오류: {str(e)}")
@@ -3204,9 +3239,16 @@ class PollingSystem:
                     retry_count = getattr(request, '_retry_count', 0)
                     if retry_count < 3:
                         request._retry_count = retry_count + 1
-                        await self.queue.put(request)
+                        # 재시도 시에도 순서 번호 증가
+                        self._queue_order += 1
+                        await self.queue.put((priority, self._queue_order, request))  # 우선순위 유지
                         logger.info(f"🔄 요청 재시도 큐에 추가: {request.id} (재시도 {retry_count + 1}/3)")
                 finally:
+                    # 보고서 생성 작업인 경우 플래그 해제
+                    if not is_data_import:
+                        async with self.report_lock:
+                            self.is_processing_report = False
+                            logger.info(f"📊 보고서 생성 완료: {request.id}")
                     # 큐 작업 완료 표시 (성공/실패 관계없이)
                     self.queue.task_done()
                     
@@ -3218,6 +3260,47 @@ class PollingSystem:
                     self.queue.task_done()
                 await asyncio.sleep(1)
     
+    async def _process_data_import(self, request: DataImportRequest):
+        """데이터 입력 작업 처리"""
+        logger.info(f"📤 [{request.table_type}] Notion DB에 데이터 추가 시작: {len(request.dataframe)}개 행")
+        
+        added_count = 0
+        failed_count = 0
+        
+        for idx, row in request.dataframe.iterrows():
+            try:
+                # DataFrame 행을 Notion 속성으로 변환
+                properties = excel_importer._convert_dataframe_row_to_notion_properties(
+                    row, request.table_type, request.dataframe
+                )
+                
+                if not properties:
+                    logger.warning(f"⚠️ [{request.table_type}] 행 {idx}: 변환된 속성이 없어 건너뜁니다.")
+                    continue
+                
+                # Notion에 추가
+                await self.orchestrator.notion.client.pages.create(
+                    parent={"database_id": self.orchestrator.notion.db_map[request.table_type]},
+                    properties=properties
+                )
+                
+                added_count += 1
+                if added_count % 10 == 0:
+                    logger.info(f"📝 [{request.table_type}] 진행 중: {added_count}/{len(request.dataframe)}개 추가됨")
+                
+                # API 제한 고려 (초당 3회)
+                await asyncio.sleep(0.35)
+                
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"❌ [{request.table_type}] 행 {idx} 추가 실패: {e}")
+        
+        logger.info(f"✅ [{request.table_type}] Notion DB 추가 완료: 성공 {added_count}개, 실패 {failed_count}개")
+        
+        # 처리된 파일을 imported 폴더로 이동 (데이터가 없어도 이동)
+        moved_count = excel_handler.move_processed_files_to_imported(request.table_type)
+        logger.info(f"✅ [{request.table_type}] {moved_count}개 파일을 imported 폴더로 이동 완료")
+    
     async def _polling(self, interval: int = 30):
         """주기적으로 새로운 요청을 큐에 추가하는 폴링 태스크"""
         logger.info("🔍 폴링 시작")
@@ -3227,8 +3310,10 @@ class PollingSystem:
             initial_requests = await self.orchestrator.notion.get_pending_requests()
             for req in initial_requests:
                 if req.id not in self.processed_ids:
-                    await self.queue.put(req)
-                    logger.info(f"📥 초기 요청 큐에 추가: {req.id} (큐 크기: {self.queue.qsize()})")
+                    # 보고서 생성 요청은 우선순위 2 (낮음)
+                    self._queue_order += 1
+                    await self.queue.put((2, self._queue_order, req))
+                    logger.info(f"📥 초기 요청 큐에 추가: {req.id} (우선순위: 2, 큐 크기: {self.queue.qsize()})")
             logger.info(f"✅ 초기 {len(initial_requests)}개 요청 큐에 추가 완료")
         except Exception as e:
             logger.error(f"❌ 초기 요청 로드 실패: {str(e)}")
@@ -3247,9 +3332,11 @@ class PollingSystem:
                 new_count = 0
                 for req in requests:
                     if req.id not in self.processed_ids:
-                        await self.queue.put(req)
+                        # 보고서 생성 요청은 우선순위 2 (낮음)
+                        self._queue_order += 1
+                        await self.queue.put((2, self._queue_order, req))
                         new_count += 1
-                        logger.info(f"📥 새 요청 큐에 추가: {req.id} (큐 크기: {self.queue.qsize()})")
+                        logger.info(f"📥 새 요청 큐에 추가: {req.id} (우선순위: 2, 큐 크기: {self.queue.qsize()})")
                 
                 if new_count == 0:
                     logger.info(f"💤 새 요청 없음 (큐 크기: {self.queue.qsize()}) ({datetime.now().strftime('%H:%M:%S')})")
@@ -3338,22 +3425,22 @@ async def excel_file_watcher_worker():
                         df = await excel_handler.preprocess_and_merge(table_type)
                         
                         if df is None or df.empty:
-                            logger.info(f"⏭️ [{table_type}] 전처리 후 데이터가 없어 건너뜁니다.")
+                            logger.info(f"⚠️ [{table_type}] 전처리 후 데이터가 없지만 파일은 이동합니다.")
+                            # 데이터가 없어도 파일을 imported 폴더로 이동
+                            moved_count = excel_handler.move_processed_files_to_imported(table_type)
+                            logger.info(f"✅ [{table_type}] {moved_count}개 파일을 imported 폴더로 이동 완료")
                             continue
                         
                         logger.info(f"✅ [{table_type}] 전처리 완료: {len(df)}개 행")
                         
-                        # 3. Notion에 추가
-                        added_count = await excel_importer.add_preprocessed_data_to_notion(df, table_type)
-                        
-                        if added_count > 0:
-                            logger.info(f"✅ [{table_type}] Notion DB에 {added_count}개 추가 완료")
-                            
-                            # 4. 처리된 파일을 imported 폴더로 이동
-                            moved_count = excel_handler.move_processed_files_to_imported(table_type)
-                            logger.info(f"✅ [{table_type}] {moved_count}개 파일을 imported 폴더로 이동 완료")
-                        else:
-                            logger.warning(f"⚠️ [{table_type}] Notion에 추가된 데이터가 없습니다.")
+                        # 3. 데이터 입력 작업을 우선순위 큐에 추가 (우선순위 1 = 높음)
+                        data_import_request = DataImportRequest(
+                            table_type=table_type,
+                            dataframe=df
+                        )
+                        polling._queue_order += 1
+                        await polling.queue.put((1, polling._queue_order, data_import_request))  # 우선순위 1
+                        logger.info(f"📥 [{table_type}] 데이터 입력 작업 큐에 추가됨 (우선순위: 1, 큐 크기: {polling.queue.qsize()})")
                             
                     except Exception as e:
                         logger.error(f"❌ [{table_type}] 자동 처리 오류: {str(e)}")
@@ -3403,10 +3490,12 @@ async def webhook():
     added_count = 0
     for req in requests:
         if req.id not in polling.processed_ids:
-            await polling.queue.put(req)
+            # 보고서 생성 요청은 우선순위 2 (낮음)
+            polling._queue_order += 1
+            await polling.queue.put((2, polling._queue_order, req))
             # processed_ids에 추가하지 않음 - 워커에서 처리할 때 추가
             added_count += 1
-            logger.info(f"📥 웹훅으로 새 요청 큐에 추가: {req.id} (큐 크기: {polling.queue.qsize()})")
+            logger.info(f"📥 웹훅으로 새 요청 큐에 추가: {req.id} (우선순위: 2, 큐 크기: {polling.queue.qsize()})")
     return {"status": "processing", "added_to_queue": added_count}
 
 @app.get("/excel/watch")
