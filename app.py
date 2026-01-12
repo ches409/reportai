@@ -3473,6 +3473,11 @@ class PollingSystem:
         try:
             initial_requests = await self.orchestrator.notion.get_pending_requests()
             for req in initial_requests:
+                # 이미 처리된 요청이지만 상태가 다시 "대기중"으로 변경된 경우 재처리
+                if req.id in self.processed_ids:
+                    logger.info(f"🔄 초기화: 재처리 요청 발견 (상태가 다시 대기중으로 변경됨): {req.id}")
+                    self.processed_ids.discard(req.id)  # processed_ids에서 제거하여 재처리 가능하도록
+                
                 if req.id not in self.processed_ids:
                     # 보고서 생성 요청은 우선순위 2 (낮음)
                     self._queue_order += 1
@@ -3495,6 +3500,11 @@ class PollingSystem:
                 # 새로운 요청만 큐에 추가 (processed_ids에 추가하지 않음 - 워커에서 처리할 때 추가)
                 new_count = 0
                 for req in requests:
+                    # 이미 처리된 요청이지만 상태가 다시 "대기중"으로 변경된 경우 재처리
+                    if req.id in self.processed_ids:
+                        logger.info(f"🔄 재처리 요청 발견 (상태가 다시 대기중으로 변경됨): {req.id}")
+                        self.processed_ids.discard(req.id)  # processed_ids에서 제거하여 재처리 가능하도록
+                    
                     if req.id not in self.processed_ids:
                         # 보고서 생성 요청은 우선순위 2 (낮음)
                         self._queue_order += 1
@@ -3674,6 +3684,11 @@ async def webhook():
     requests = await polling.orchestrator.notion.get_pending_requests()
     added_count = 0
     for req in requests:
+        # 이미 처리된 요청이지만 상태가 다시 "대기중"으로 변경된 경우 재처리
+        if req.id in polling.processed_ids:
+            logger.info(f"🔄 웹훅: 재처리 요청 발견 (상태가 다시 대기중으로 변경됨): {req.id}")
+            polling.processed_ids.discard(req.id)  # processed_ids에서 제거하여 재처리 가능하도록
+        
         if req.id not in polling.processed_ids:
             # 보고서 생성 요청은 우선순위 2 (낮음)
             polling._queue_order += 1
