@@ -88,6 +88,7 @@ class Class:
     start_date: datetime
     school_name: str
     grade: int
+    type: str  # 특목, 본관 구분
 
 @dataclass
 class DISCHARGE:
@@ -102,6 +103,8 @@ class DISCHARGE:
     discharging_reason: str
     school_name: str
     grade: int
+    type: str  # 특목, 본관 구분
+
 
 
 @dataclass
@@ -349,36 +352,7 @@ class NotionManager:
                         "select": {"equals": value[0]}
                     })
         
-        # 날짜 범위: AI가 날짜 속성명을 명시한 경우에만 사용
-        if query.date_range and isinstance(query.date_range, dict) and query.date_range.get("property"):
-            date_prop = query.date_range.get("property")
-            start_val = query.date_range.get("start")
-            end_val = query.date_range.get("end")
-            
-            # 시작일과 종료일을 별도의 조건으로 분리
-            if start_val:
-                start_cond = {
-                    "property": date_prop,
-                    "date": {
-                        "on_or_after": start_val
-                    }
-                }
-                conditions.append(start_cond)
-                logger.info(f"📅 날짜 필터 생성 (시작): {date_prop} >= {start_val}")
-            
-            if end_val:
-                end_cond = {
-                    "property": date_prop,
-                    "date": {
-                        "on_or_before": end_val
-                    }
-                }
-                conditions.append(end_cond)
-                logger.info(f"📅 날짜 필터 생성 (종료): {date_prop} <= {end_val}")
-        else:
-            # date_range가 존재하지만 property가 누락된 경우 필터 추가를 건너뜁니다.
-            if query.date_range and isinstance(query.date_range, dict) and not query.date_range.get("property"):
-                logger.debug("_build_filter: date_range provided without 'property' — skipping date filter")
+        # 날짜 필터는 query_table에서 처리 (Notion API 필터가 완벽하지 않을 수 있으므로)
         
         # 조건이 하나도 없으면 None 반환
         if len(conditions) == 0:
@@ -552,9 +526,9 @@ class OllamaAnalyzer:
         question_lower = question.lower()
         now = datetime.now()
         
-        # "X년 Y월부터 Z월까지" 형식 처리 (예: "2025년 3월부터 7월까지")
-        # 더 유연한 패턴: "부터"와 "까지" 사이에 공백이나 다른 문자가 있어도 매칭
-        month_range_match = re.search(r'(\d{4})\s*년\s*(\d{1,2})\s*월\s*부터.*?(\d{1,2})\s*월\s*까지', question)
+        # "X년 Y월부터 Z월까지" 형식 처리 (예: "2025년 3월부터 7월까지", "2025년 유형신 선생님 3월부터 7월까지")
+        # 더 유연한 패턴: 년도와 첫 번째 월 사이, "부터"와 "까지" 사이에 어떤 텍스트가 있어도 매칭
+        month_range_match = re.search(r'(\d{4})\s*년.*?(\d{1,2})\s*월\s*부터.*?(\d{1,2})\s*월\s*까지', question)
         if month_range_match:
             year = int(month_range_match.group(1))
             start_month = int(month_range_match.group(2))
@@ -572,8 +546,9 @@ class OllamaAnalyzer:
             logger.info(f"📅 날짜 범위 파싱 (월 범위): {year}년 {start_month}월 ~ {end_month}월 → {result['start']} ~ {result['end']}")
             return result
         
-        # "X년 Y월부터" 형식 처리 (예: "2025년 3월부터")
-        month_start_match = re.search(r'(\d{4})\s*년\s*(\d{1,2})\s*월\s*부터', question)
+        # "X년 Y월부터" 형식 처리 (예: "2025년 3월부터", "2025년 유형신 선생님 3월부터")
+        # 년도와 월 사이에 어떤 텍스트가 있어도 매칭
+        month_start_match = re.search(r'(\d{4})\s*년.*?(\d{1,2})\s*월\s*부터', question)
         if month_start_match:
             year = int(month_start_match.group(1))
             start_month = int(month_start_match.group(2))
@@ -587,8 +562,9 @@ class OllamaAnalyzer:
                 "end": end_date.strftime("%Y-%m-%d")
             }
         
-        # "X년 Y월" 형식 처리 (예: "2025년 3월")
-        single_month_match = re.search(r'(\d{4})\s*년\s*(\d{1,2})\s*월\s*(?!부터|까지)', question)
+        # "X년 Y월" 형식 처리 (예: "2025년 3월", "2025년 유형신 선생님 3월")
+        # 년도와 월 사이에 어떤 텍스트가 있어도 매칭 (단, "부터"나 "까지"가 바로 뒤에 오는 경우는 제외)
+        single_month_match = re.search(r'(\d{4})\s*년.*?(\d{1,2})\s*월\s*(?!부터|까지)', question)
         if single_month_match:
             year = int(single_month_match.group(1))
             month = int(single_month_match.group(2))
@@ -690,13 +666,7 @@ class OllamaAnalyzer:
                 "end": end_date.strftime("%Y-%m-%d")
             }
         
-        # 날짜가 명시되지 않았지만 통계/현황 질문인 경우 -> 올해 전체
-        if any(keyword in question_lower for keyword in ["통계", "현황", "추이", "요약"]):
-            year = now.year
-            return {
-                "start": f"{year}-01-01",
-                "end": f"{year}-12-31"
-            }
+        
         
         # 기본값: 날짜 범위 없음
         return None
@@ -1075,6 +1045,7 @@ class ExcelFileHandler:
     def __init__(self, notion_manager: Optional[NotionManager] = None):
         self.input_dir = Path("input")
         self.processed_files = set()  # 처리된 파일 추적 (중복 방지)
+        self.queued_files = set()  # 큐에 추가된 파일 추적 (중복 큐 추가 방지)
         self.table_folders = {
             "class": self.input_dir / "class",
             "discharge": self.input_dir / "discharge",
@@ -1166,17 +1137,30 @@ class ExcelFileHandler:
                 # 파일 경로를 키로 사용하여 처리 여부 확인
                 file_key = str(excel_file.resolve())
                 
+                # 이미 처리되었거나 큐에 추가된 파일은 건너뜀
                 if file_key in self.processed_files:
                     logger.debug(f"⏭️ [{table_type}] 이미 처리된 파일 건너뜀: {excel_file.name}")
+                    continue
+                
+                if file_key in self.queued_files:
+                    logger.debug(f"⏭️ [{table_type}] 이미 큐에 추가된 파일 건너뜀: {excel_file.name}")
+                    continue
+                
+                # 이미 stored_files에 있는 파일인지 확인 (같은 파일이 여러 번 스캔되는 것 방지)
+                already_stored = False
+                for stored_file in self.stored_files[table_type]:
+                    if stored_file.get("file_key") == file_key:
+                        already_stored = True
+                        break
+                
+                if already_stored:
+                    logger.debug(f"⏭️ [{table_type}] 이미 저장된 파일 건너뜀: {excel_file.name}")
                     continue
                 
                 # 엑셀 파일 읽기
                 df = self._read_excel_file(excel_file)
                 
                 if df is not None:
-                    # 처리 성공 시 기록 및 폴더별로 저장
-                    self.processed_files.add(file_key)
-                    
                     # 상대 경로 생성 (안전하게)
                     try:
                         file_path_str = str(excel_file.resolve().relative_to(Path.cwd().resolve()))
@@ -1187,6 +1171,7 @@ class ExcelFileHandler:
                     file_info = {
                         "file_name": excel_file.name,
                         "file_path": file_path_str,
+                        "file_key": file_key,  # 파일 키 추가
                         "folder": table_type,
                         "dataframe": df,
                         "rows": len(df),
@@ -1195,6 +1180,9 @@ class ExcelFileHandler:
                     }
                     # 폴더별로 구별해서 저장
                     self.stored_files[table_type].append(file_info)
+                    # 파일을 읽은 즉시 processed_files에 추가하여 다음 스캔에서 건너뛰도록 함
+                    # (파일 이동 후에도 다시 추가되지만, 이미 processed_files에 있으면 건너뜀)
+                    self.processed_files.add(file_key)
                     new_files_count += 1
                     logger.info(f"✅ [{table_type}] 파일 저장 완료: {excel_file.name} ({len(df)}개 행)")
                 else:
@@ -1275,6 +1263,7 @@ class ExcelFileHandler:
         # 날짜 필터링 (Notion에 있는 날짜 범위 제외)
         before_date_filter_count = len(filtered_df)
         date_filtered_df = await self._filter_by_notion_date_range(filtered_df, table_type)
+        #date_filtered_df = filtered_df
         date_filter_removed_count = before_date_filter_count - len(date_filtered_df)
         
         if date_filter_removed_count > 0:
@@ -1460,7 +1449,8 @@ class ExcelFileHandler:
     def reset_processed_files(self):
         """처리된 파일 목록 초기화 (모든 파일을 다시 읽을 수 있도록)"""
         self.processed_files.clear()
-        logger.info("🔄 처리된 파일 목록 초기화 완료")
+        self.queued_files.clear()  # 큐 목록도 함께 초기화
+        logger.info("🔄 처리된 파일 목록 및 큐 목록 초기화 완료")
     
     def move_processed_files_to_imported(self, table_type: str) -> int:
         """처리된 파일들을 imported 폴더로 이동
@@ -1489,6 +1479,7 @@ class ExcelFileHandler:
         for file_info in file_list:
             try:
                 file_path = Path(file_info["file_path"])
+                file_key = file_info.get("file_key")
                 
                 # 절대 경로로 변환
                 if not file_path.is_absolute():
@@ -1496,6 +1487,10 @@ class ExcelFileHandler:
                 
                 if not file_path.exists():
                     logger.warning(f"⚠️ 파일이 존재하지 않음: {file_path}")
+                    # 파일이 없어도 추적 목록에서 제거
+                    if file_key:
+                        self.queued_files.discard(file_key)
+                        self.processed_files.add(file_key)
                     continue
                 
                 # imported 폴더로 이동할 파일명 생성 (타임스탬프 추가로 중복 방지)
@@ -1514,6 +1509,11 @@ class ExcelFileHandler:
                 moved_count += 1
                 logger.info(f"📦 [{table_type}] 파일 이동: {file_path.name} → {dest_path}")
                 
+                # 파일 이동 성공 시 추적 목록 업데이트
+                if file_key:
+                    self.queued_files.discard(file_key)  # 큐 목록에서 제거
+                    self.processed_files.add(file_key)  # 처리 완료 목록에 추가
+                
             except Exception as e:
                 logger.error(f"❌ [{table_type}] 파일 이동 실패: {file_info['file_name']}, 오류: {e}")
         
@@ -1521,6 +1521,88 @@ class ExcelFileHandler:
             logger.info(f"✅ [{table_type}] {moved_count}개 파일을 imported 폴더로 이동 완료")
             # 이동된 파일은 stored_files에서 제거
             self.stored_files[table_type] = []
+        
+        return moved_count
+    
+    def move_specific_files_to_imported(self, table_type: str, file_infos: List[Dict[str, Any]]) -> int:
+        """특정 파일들만 imported 폴더로 이동
+        
+        Args:
+            table_type: 테이블 타입 (class, discharge, student)
+            file_infos: 이동할 파일 정보 목록
+        
+        Returns:
+            이동된 파일 수
+        """
+        if table_type not in self.stored_files:
+            logger.error(f"❌ 알 수 없는 테이블 타입: {table_type}")
+            return 0
+        
+        if not file_infos:
+            logger.warning(f"⚠️ [{table_type}] 이동할 파일 정보가 없습니다.")
+            return 0
+        
+        # imported 폴더 생성
+        imported_dir = self.input_dir / "imported" / table_type
+        imported_dir.mkdir(parents=True, exist_ok=True)
+        
+        moved_count = 0
+        moved_file_keys = set()
+        
+        for file_info in file_infos:
+            try:
+                file_path = Path(file_info["file_path"])
+                file_key = file_info.get("file_key")
+                
+                # 절대 경로로 변환
+                if not file_path.is_absolute():
+                    file_path = Path.cwd() / file_path
+                
+                if not file_path.exists():
+                    logger.warning(f"⚠️ 파일이 존재하지 않음: {file_path}")
+                    # 파일이 없어도 추적 목록에서 제거
+                    if file_key:
+                        self.queued_files.discard(file_key)
+                        self.processed_files.add(file_key)
+                        moved_file_keys.add(file_key)
+                    continue
+                
+                # imported 폴더로 이동할 파일명 생성 (타임스탬프 추가로 중복 방지)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                file_name = file_path.name
+                name_parts = file_name.rsplit('.', 1)
+                if len(name_parts) == 2:
+                    new_file_name = f"{name_parts[0]}_{timestamp}.{name_parts[1]}"
+                else:
+                    new_file_name = f"{file_name}_{timestamp}"
+                
+                dest_path = imported_dir / new_file_name
+                
+                # 파일 이동
+                file_path.rename(dest_path)
+                moved_count += 1
+                logger.info(f"📦 [{table_type}] 파일 이동: {file_path.name} → {dest_path}")
+                
+                # 파일 이동 성공 시 추적 목록 업데이트
+                if file_key:
+                    self.queued_files.discard(file_key)  # 큐 목록에서 제거
+                    self.processed_files.add(file_key)  # 처리 완료 목록에 추가
+                    moved_file_keys.add(file_key)
+                
+            except Exception as e:
+                logger.error(f"❌ [{table_type}] 파일 이동 실패: {file_info.get('file_name', 'unknown')}, 오류: {e}")
+        
+        # stored_files에서 이동된 파일들만 제거
+        if moved_file_keys:
+            remaining_files = [
+                f for f in self.stored_files[table_type]
+                if f.get("file_key") not in moved_file_keys
+            ]
+            self.stored_files[table_type] = remaining_files
+            logger.debug(f"🔄 [{table_type}] stored_files에서 {len(moved_file_keys)}개 파일 제거, {len(remaining_files)}개 파일 남음")
+        
+        if moved_count > 0:
+            logger.info(f"✅ [{table_type}] {moved_count}개 파일을 imported 폴더로 이동 완료")
         
         return moved_count
 
@@ -1650,6 +1732,22 @@ class ExcelImporter:
                             properties["grade"] = {"number": int(grade)}
                     except:
                         pass
+            
+            # type -> type (특목, 본관 구분)
+            if "type" in df.columns or "타입" in df.columns or "구분" in df.columns:
+                col = None
+                if "type" in df.columns:
+                    col = "type"
+                elif "타입" in df.columns:
+                    col = "타입"
+                elif "구분" in df.columns:
+                    col = "구분"
+                
+                if col and pd.notna(row[col]):
+                    type_value = str(row[col]).strip()
+                    if type_value:
+                        # rich_text 타입으로 처리 (특목, 본관)
+                        properties["type"] = {"rich_text": [{"text": {"content": type_value}}]}
         
         elif table_type == "discharge":
             # discharge 테이블 속성 매핑 (지정된 컬럼명 사용)
@@ -1745,6 +1843,22 @@ class ExcelImporter:
                         properties["discharge_date"] = {"date": {"start": date_obj.strftime("%Y-%m-%d")}}
                     except:
                         pass
+            
+            # type -> type (특목, 본관 구분)
+            if "type" in df.columns or "타입" in df.columns or "구분" in df.columns:
+                col = None
+                if "type" in df.columns:
+                    col = "type"
+                elif "타입" in df.columns:
+                    col = "타입"
+                elif "구분" in df.columns:
+                    col = "구분"
+                
+                if col and pd.notna(row[col]):
+                    type_value = str(row[col]).strip()
+                    if type_value:
+                        # rich_text 타입으로 처리 (특목, 본관)
+                        properties["type"] = {"rich_text": [{"text": {"content": type_value}}]}
         
         elif table_type == "student":
             # student 테이블 속성 매핑 (필요한 속성 추가)
@@ -1897,21 +2011,48 @@ class EnhancedDischargeReportGenerator:
                                 teacher_name: str, 
                                 year: int, 
                                 month: int) -> Dict:
-        """12개월 추이 데이터"""
-        trend_data = []
-        
-        # 과거 11개월 + 현재월 = 12개월
-        for i in range(11, -1, -1):
-            # i개월 전 계산
-            target_date = datetime(year, month, 1) - timedelta(days=i*30)
-            target_year = target_date.year
-            target_month = target_date.month
-            
-            start_date, end_date = self._get_month_range(
-                target_year, target_month
-            )
-            
-            # 해당 월 입퇴소 수
+        """가용 데이터 개월 수에 맞춘 월별 추이 데이터"""
+        trend_data: List[Dict[str, Any]] = []
+
+        # 1) 데이터에 존재하는 월 수집 (class: start_date, discharge: discharge_date)
+        months_set: set = set()
+
+        def _add_month(val):
+            if not val:
+                return
+            if isinstance(val, list):
+                for v in val:
+                    _add_month(v)
+                return
+            try:
+                d = datetime.fromisoformat(str(val).split("T")[0])
+                months_set.add((d.year, d.month))
+            except Exception:
+                return
+
+        if isinstance(query_results, dict):
+            normalized = {k.lower(): v for k, v in query_results.items()}
+            for item in normalized.get("class", []):
+                v = item.get("start_date") or item.get("start") or item.get("입소일") or item.get("startDate")
+                _add_month(v)
+            for item in normalized.get("discharge", []):
+                v = item.get("discharge_date") or item.get("discharge") or item.get("퇴소일") or item.get("dischargeDate")
+                _add_month(v)
+
+        # 2) 사용할 월 목록 결정
+        if months_set:
+            month_targets = sorted(months_set)  # (year, month) 오름차순
+        else:
+            # 데이터가 없으면 기존처럼 최근 12개월을 사용
+            month_targets = []
+            for i in range(11, -1, -1):
+                target_date = datetime(year, month, 1) - timedelta(days=i*30)
+                month_targets.append((target_date.year, target_date.month))
+
+        # 3) 월별 입소/퇴소 집계
+        for target_year, target_month in month_targets:
+            start_date, end_date = self._get_month_range(target_year, target_month)
+
             enrollments = await self.year_month_enrollment(
                 query_results, target_year, target_month
             )
@@ -1919,9 +2060,8 @@ class EnhancedDischargeReportGenerator:
                 query_results, target_year, target_month
             )
 
-            # debug 로그: 각 월별 조회 결과 수 확인
             logger.debug(f"[Trend] {target_year}-{target_month:02d} enrollments={len(enrollments)} discharges={len(discharges)}")
-            
+
             trend_data.append({
                 "year": target_year,
                 "month": target_month,
@@ -1930,8 +2070,14 @@ class EnhancedDischargeReportGenerator:
                 "discharges": len(discharges),
                 "net_change": len(enrollments) - len(discharges)
             })
-        
-        return {"monthly_data": trend_data}
+
+        # 4) 차트 타입 결정: 데이터가 한 개월뿐이면 막대형
+        chart_type = "bar" if len(trend_data) == 1 else "line"
+
+        return {
+            "monthly_data": trend_data,
+            "chart_type": chart_type
+        }
     
     async def _get_detailed_student_list(self, query_results
                                         ) -> List[Dict]:
@@ -2096,7 +2242,7 @@ class EnhancedDischargeReportGenerator:
         wb = openpyxl.Workbook()
         wb.remove(wb.active)
         
-        # ===== 시트 1: 12개월 추이 (차트 포함) =====
+        # ===== 시트 1: 월별 추이 (차트 포함) =====
         ws_trend = wb.create_sheet("월별 추이")
         self._create_trend_sheet_with_chart(ws_trend, report_data)
 
@@ -2126,13 +2272,16 @@ class EnhancedDischargeReportGenerator:
         return output_path
     
     def _create_trend_sheet_with_chart(self, ws, report_data: Dict):
-        """12개월 추이 시트 + 차트"""
-        trend_data = report_data["yearly_trend"]["monthly_data"]
+        """월별 추이 시트 + 차트 (데이터 개월수 기반)"""
+        trend_info = report_data.get("yearly_trend", {})
+        trend_data = trend_info.get("monthly_data", [])
+        chart_type = trend_info.get("chart_type", "line")
+        month_count = len(trend_data)
         
         # 제목
         ws.merge_cells('A1:G1')
         title = ws['A1']
-        title.value = f"📈 {report_data['teacher_name']} - 12개월 입퇴소 추이"
+        title.value = f"📈 {report_data['teacher_name']} - {month_count}개월 입퇴소 추이"
         title.font = Font(size=16, bold=True, color="FFFFFF")
         title.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
         title.alignment = Alignment(horizontal="center", vertical="center")
@@ -2176,36 +2325,47 @@ class EnhancedDischargeReportGenerator:
         ws.column_dimensions['D'].width = 10
         
         # ===== 차트 생성 =====
-        # 꺾은선 차트 (입소/퇴소)
-        line_chart = LineChart()
-        line_chart.title = "월별 입퇴소 추이"
-        line_chart.style = 13
-        line_chart.y_axis.title = "인원 (명)"
-        line_chart.x_axis.title = "월"
-        line_chart.height = 12
-        line_chart.width = 24
-        
-        # 데이터 범위
-        data = Reference(ws, min_col=2, min_row=header_row, 
-                        max_row=header_row + len(trend_data), max_col=3)
-        cats = Reference(ws, min_col=1, min_row=header_row + 1, 
-                        max_row=header_row + len(trend_data))
-        
-        line_chart.add_data(data, titles_from_data=True)
-        line_chart.set_categories(cats)
-        # 색상 지정: series[0]=입소(초록), series[1]=퇴소(붉은)
-        try:
-            line_chart.series[0].graphicalProperties.line.solidFill = "00B050"
-            line_chart.series[1].graphicalProperties.line.solidFill = "FF0000"
-        except Exception:
-            pass
-        
-        # 데이터 레이블 표시
-        line_chart.dataLabels = DataLabelList()
-        line_chart.dataLabels.showVal = True
-        
-        # 차트 삽입 위치
-        ws.add_chart(line_chart, f"F3")
+        # 데이터 범위 (월, 입소, 퇴소)
+        data_ref = Reference(ws, min_col=2, min_row=header_row, 
+                             max_row=header_row + len(trend_data), max_col=3)
+        cats_ref = Reference(ws, min_col=1, min_row=header_row + 1, 
+                             max_row=header_row + len(trend_data))
+
+        if chart_type == "bar":
+            # 데이터가 한 개월뿐이면 막대형으로 표현
+            bar_chart_main = BarChart()
+            bar_chart_main.type = "col"
+            bar_chart_main.title = "월별 입퇴소"
+            bar_chart_main.y_axis.title = "인원 (명)"
+            bar_chart_main.x_axis.title = "월"
+            bar_chart_main.height = 12
+            bar_chart_main.width = 24
+            bar_chart_main.add_data(data_ref, titles_from_data=True)
+            bar_chart_main.set_categories(cats_ref)
+            bar_chart_main.dataLabels = DataLabelList()
+            bar_chart_main.dataLabels.showVal = True
+            ws.add_chart(bar_chart_main, f"F3")
+        else:
+            # 기본: 꺾은선 차트 (입소/퇴소)
+            line_chart = LineChart()
+            line_chart.title = "월별 입퇴소 추이"
+            line_chart.style = 13
+            line_chart.y_axis.title = "인원 (명)"
+            line_chart.x_axis.title = "월"
+            line_chart.height = 12
+            line_chart.width = 24
+            
+            line_chart.add_data(data_ref, titles_from_data=True)
+            line_chart.set_categories(cats_ref)
+            try:
+                line_chart.series[0].graphicalProperties.line.solidFill = "00B050"
+                line_chart.series[1].graphicalProperties.line.solidFill = "FF0000"
+            except Exception:
+                pass
+            
+            line_chart.dataLabels = DataLabelList()
+            line_chart.dataLabels.showVal = True
+            ws.add_chart(line_chart, f"F3")
         
         # 막대 차트 (순증감)
         bar_chart = BarChart()
@@ -3161,6 +3321,7 @@ class DataImportRequest:
     """데이터 입력 요청"""
     table_type: str
     dataframe: pd.DataFrame
+    file_infos: List[Dict[str, Any]] = field(default_factory=list)  # 처리할 파일 정보 목록
     id: str = field(default_factory=lambda: f"data_import_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}")
     _is_data_import: bool = True
     _retry_count: int = 0
@@ -3297,9 +3458,12 @@ class PollingSystem:
         
         logger.info(f"✅ [{request.table_type}] Notion DB 추가 완료: 성공 {added_count}개, 실패 {failed_count}개")
         
-        # 처리된 파일을 imported 폴더로 이동 (데이터가 없어도 이동)
-        moved_count = excel_handler.move_processed_files_to_imported(request.table_type)
-        logger.info(f"✅ [{request.table_type}] {moved_count}개 파일을 imported 폴더로 이동 완료")
+        # 처리된 파일을 imported 폴더로 이동 (해당 요청에 포함된 파일들만 이동)
+        if request.file_infos:
+            moved_count = excel_handler.move_specific_files_to_imported(request.table_type, request.file_infos)
+            logger.info(f"✅ [{request.table_type}] {moved_count}개 파일을 imported 폴더로 이동 완료")
+        else:
+            logger.warning(f"⚠️ [{request.table_type}] 이동할 파일 정보가 없습니다.")
     
     async def _polling(self, interval: int = 30):
         """주기적으로 새로운 요청을 큐에 추가하는 폴링 태스크"""
@@ -3433,14 +3597,35 @@ async def excel_file_watcher_worker():
                         
                         logger.info(f"✅ [{table_type}] 전처리 완료: {len(df)}개 행")
                         
-                        # 3. 데이터 입력 작업을 우선순위 큐에 추가 (우선순위 1 = 높음)
+                        # 3. 큐에 추가하기 전에 해당 테이블 타입의 파일들을 queued_files에 추가
+                        for file_info in excel_handler.stored_files[table_type]:
+                            file_key = file_info.get("file_key")
+                            if file_key:
+                                excel_handler.queued_files.add(file_key)
+                        
+                        # 4. 데이터 입력 작업을 우선순위 큐에 추가 (우선순위 1 = 높음)
+                        # 현재 stored_files에 있는 파일 정보를 복사 (처리 완료 후 이동하기 위해)
+                        current_file_infos = excel_handler.stored_files[table_type].copy()
                         data_import_request = DataImportRequest(
                             table_type=table_type,
-                            dataframe=df
+                            dataframe=df,
+                            file_infos=current_file_infos  # 파일 정보 포함
                         )
                         polling._queue_order += 1
                         await polling.queue.put((1, polling._queue_order, data_import_request))  # 우선순위 1
                         logger.info(f"📥 [{table_type}] 데이터 입력 작업 큐에 추가됨 (우선순위: 1, 큐 크기: {polling.queue.qsize()})")
+                        
+                        # 큐에 추가한 후 해당 파일들을 stored_files에서 제거 (처리 완료 후 이동하기 위해 요청에 포함됨)
+                        # 요청에 파일 정보가 포함되어 있으므로, 처리 완료 시 해당 파일들만 이동됨
+                        for file_info in current_file_infos:
+                            file_key = file_info.get("file_key")
+                            if file_key:
+                                # stored_files에서 해당 파일 제거
+                                excel_handler.stored_files[table_type] = [
+                                    f for f in excel_handler.stored_files[table_type]
+                                    if f.get("file_key") != file_key
+                                ]
+                        logger.debug(f"🔄 [{table_type}] 큐 추가 후 해당 파일들을 stored_files에서 제거 (요청에 포함됨)")
                             
                     except Exception as e:
                         logger.error(f"❌ [{table_type}] 자동 처리 오류: {str(e)}")

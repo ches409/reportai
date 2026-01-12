@@ -7,6 +7,7 @@
 - school_name
 - grade
 - discharging_reason
+- type
 
 각 필터의 출력값 예시는 다음과 같다. 
 - student_name: 다연이 -> 다연, 철수 -> 철수, 최민욱 -> 최민욱
@@ -15,6 +16,7 @@
 - school_name: oo초등학교 -> oo초, xx중학교 -> xx중, yy고등학교 -> yy고
 - grade: 3학년 -> 3, 5학년 -> 5
 - discharging_reason: 전학 -> 전학, 개인 사정 -> 개인 사정, 기타 -> 기타
+- type: 특목 -> 특목, 본관 -> 본관
 
 
 질문: 
