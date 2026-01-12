@@ -528,7 +528,7 @@ class OllamaAnalyzer:
         
         # "X년 Y월부터 Z월까지" 형식 처리 (예: "2025년 3월부터 7월까지", "2025년 유형신 선생님 3월부터 7월까지")
         # 더 유연한 패턴: 년도와 첫 번째 월 사이, "부터"와 "까지" 사이에 어떤 텍스트가 있어도 매칭
-        month_range_match = re.search(r'(\d{4})\s*년.*?(\d{1,2})\s*월\s*부터.*?(\d{1,2})\s*월\s*까지', question)
+        month_range_match = re.search(r'(\d{4})\s*년.*?(\d{1,2})\s*(?:월\s*)?부터.*?(\d{1,2})\s*(?:월\s*)까지', question)
         if month_range_match:
             year = int(month_range_match.group(1))
             start_month = int(month_range_match.group(2))
@@ -3279,7 +3279,7 @@ class ReportOrchestrator:
         )
         
         # 차트 포함 Excel 생성
-        filename = f"discharge_chart_{teacher_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        filename = f"{teacher_name}_입퇴소보고서"
         excel_path = self.discharge_report.create_excel_with_chart(
             report_data, filename
         )
@@ -3354,11 +3354,7 @@ class PollingSystem:
                 if request is None:
                     continue
                 
-                # 이미 처리 중이거나 완료된 요청은 건너뛰기
-                if request.id in self.processed_ids:
-                    logger.debug(f"⏭️ 이미 처리된 요청 건너뛰기: {request.id}")
-                    self.queue.task_done()
-                    continue
+   
                 
                 # 데이터 입력 작업인 경우 보고서 생성이 끝날 때까지 대기
                 is_data_import = getattr(request, '_is_data_import', False)
@@ -3373,9 +3369,6 @@ class PollingSystem:
                 
                 # 처리 시도
                 try:
-                    # 처리 시작 시 processed_ids에 추가 (중복 처리 방지)
-                    self.processed_ids.add(request.id)
-                    
                     # 보고서 생성 작업인 경우 플래그 설정
                     if not is_data_import:
                         async with self.report_lock:
@@ -3390,10 +3383,22 @@ class PollingSystem:
                         await self.orchestrator.process_request(request)
                     
                     logger.info(f"✅ 요청 처리 완료: {request.id}")
+                    # 성공적으로 처리 완료 시 processed_ids에서 제거 (재처리 가능하도록, 메모리 관리)
+                    # 특정 요청 ID만 제거 (다른 요청들은 유지)
+                    if request.id in self.processed_ids:
+                        self.processed_ids.discard(request.id)
+                        logger.info(f"🗑️ processed_ids에서 제거: {request.id} (현재 processed_ids 크기: {len(self.processed_ids)})")
+                    else:
+                        logger.warning(f"⚠️ processed_ids에 없는 요청 ID: {request.id}")
                 except Exception as e:
                     logger.error(f"❌ 요청 처리 실패: {request.id}, 오류: {str(e)}")
                     # 처리 실패 시 processed_ids에서 제거하여 재시도 가능하도록
-                    self.processed_ids.discard(request.id)
+                    # 특정 요청 ID만 제거 (다른 요청들은 유지)
+                    if request.id in self.processed_ids:
+                        self.processed_ids.discard(request.id)
+                        logger.info(f"🗑️ 처리 실패로 processed_ids에서 제거: {request.id} (현재 processed_ids 크기: {len(self.processed_ids)})")
+                    else:
+                        logger.warning(f"⚠️ processed_ids에 없는 요청 ID (실패): {request.id}")
                     import traceback
                     logger.error(f"상세 오류:\n{traceback.format_exc()}")
                     # 실패한 요청을 다시 큐에 넣어 재시도 (무한 루프 방지를 위해 최대 3회)
@@ -3473,12 +3478,9 @@ class PollingSystem:
         try:
             initial_requests = await self.orchestrator.notion.get_pending_requests()
             for req in initial_requests:
-                # 이미 처리된 요청이지만 상태가 다시 "대기중"으로 변경된 경우 재처리
-                if req.id in self.processed_ids:
-                    logger.info(f"🔄 초기화: 재처리 요청 발견 (상태가 다시 대기중으로 변경됨): {req.id}")
-                    self.processed_ids.discard(req.id)  # processed_ids에서 제거하여 재처리 가능하도록
-                
                 if req.id not in self.processed_ids:
+                    # 큐에 추가할 때 즉시 processed_ids에 추가 (중복 방지)
+                    self.processed_ids.add(req.id)
                     # 보고서 생성 요청은 우선순위 2 (낮음)
                     self._queue_order += 1
                     await self.queue.put((2, self._queue_order, req))
@@ -3500,12 +3502,9 @@ class PollingSystem:
                 # 새로운 요청만 큐에 추가 (processed_ids에 추가하지 않음 - 워커에서 처리할 때 추가)
                 new_count = 0
                 for req in requests:
-                    # 이미 처리된 요청이지만 상태가 다시 "대기중"으로 변경된 경우 재처리
-                    if req.id in self.processed_ids:
-                        logger.info(f"🔄 재처리 요청 발견 (상태가 다시 대기중으로 변경됨): {req.id}")
-                        self.processed_ids.discard(req.id)  # processed_ids에서 제거하여 재처리 가능하도록
-                    
                     if req.id not in self.processed_ids:
+                        # 큐에 추가할 때 즉시 processed_ids에 추가 (중복 방지)
+                        self.processed_ids.add(req.id)
                         # 보고서 생성 요청은 우선순위 2 (낮음)
                         self._queue_order += 1
                         await self.queue.put((2, self._queue_order, req))
@@ -3684,16 +3683,10 @@ async def webhook():
     requests = await polling.orchestrator.notion.get_pending_requests()
     added_count = 0
     for req in requests:
-        # 이미 처리된 요청이지만 상태가 다시 "대기중"으로 변경된 경우 재처리
-        if req.id in polling.processed_ids:
-            logger.info(f"🔄 웹훅: 재처리 요청 발견 (상태가 다시 대기중으로 변경됨): {req.id}")
-            polling.processed_ids.discard(req.id)  # processed_ids에서 제거하여 재처리 가능하도록
-        
         if req.id not in polling.processed_ids:
             # 보고서 생성 요청은 우선순위 2 (낮음)
             polling._queue_order += 1
             await polling.queue.put((2, polling._queue_order, req))
-            # processed_ids에 추가하지 않음 - 워커에서 처리할 때 추가
             added_count += 1
             logger.info(f"📥 웹훅으로 새 요청 큐에 추가: {req.id} (우선순위: 2, 큐 크기: {polling.queue.qsize()})")
     return {"status": "processing", "added_to_queue": added_count}
