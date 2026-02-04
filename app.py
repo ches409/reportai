@@ -892,9 +892,9 @@ class OllamaAnalyzer:
         
         # 테이블별 기본 컬럼
         if table_type == "class":
-            base_columns.extend(["student_name", "start_date", "grade", "class_name", "parent_phone_number"])
+            base_columns.extend(["student_name", "start_date", "grade", "class_name", "parent_phone_number", "school_name"])
         elif table_type == "discharge":
-            base_columns.extend(["student_name", "grade", "class_name", "discharge_date", "start_date", "discharging_reason", "parent_phone_number"])
+            base_columns.extend(["student_name", "grade", "class_name", "discharge_date", "start_date", "discharging_reason", "parent_phone_number", "school_name"])
         
         # 질문에서 명시적으로 언급된 컬럼 확인
         column_keywords = {
@@ -2139,10 +2139,26 @@ class EnhancedDischargeReportGenerator:
             # enrollments now use internal English keys; map to output Korean keys
             start_val = student.get("start_date")
             is_from_discharge = bool(student.get("_from_discharge"))
+            grade_value = student.get("grade")
+            grade_num = None
+            if isinstance(grade_value, int):
+                grade_num = grade_value
+            elif isinstance(grade_value, str):
+                match = re.search(r"\d+", grade_value)
+                if match:
+                    grade_num = int(match.group())
+            grade_label = f"{grade_num}학년" if grade_num is not None else grade_value
+            school_name = str(student.get("school_name") or "").strip()
+            class_name_text = str(student.get("class_name") or "")
+            if isinstance(student.get("class_name"), list):
+                class_name_text = ", ".join(student.get("class_name"))
+            if ("유아" in school_name or "유치" in school_name or "유아" in class_name_text or "유치" in class_name_text) and grade_num is not None:
+                grade_label = f"{grade_num}세"
             detailed_list.append({
                 "학생명": student.get("student_name"),
-                "학년": f"{student.get('grade')}학년" if isinstance(student.get('grade'), int) else student.get('grade'),
+                "학년": grade_label,
                 "반": student.get("class_name"),
+                "학교": student.get("school_name"),
                 "입소일자": start_val,
                 "퇴소일자": None,
                 "재원상태": "퇴원" if is_from_discharge else "재원중",
@@ -2158,10 +2174,26 @@ class EnhancedDischargeReportGenerator:
         for student in discharges:
             start_val = student.get("start_date")
             end_val = student.get("discharge_date")
+            grade_value = student.get("grade")
+            grade_num = None
+            if isinstance(grade_value, int):
+                grade_num = grade_value
+            elif isinstance(grade_value, str):
+                match = re.search(r"\d+", grade_value)
+                if match:
+                    grade_num = int(match.group())
+            grade_label = f"{grade_num}학년" if grade_num is not None else grade_value
+            school_name = str(student.get("school_name") or "").strip()
+            class_name_text = str(student.get("class_name") or "")
+            if isinstance(student.get("class_name"), list):
+                class_name_text = ", ".join(student.get("class_name"))
+            if ("유아" in school_name or "유치" in school_name or "유아" in class_name_text or "유치" in class_name_text) and grade_num is not None:
+                grade_label = f"{grade_num}세"
             detailed_list.append({
                 "학생명": student.get("student_name"),
-                "학년": f"{student.get('grade')}학년" if isinstance(student.get('grade'), int) else student.get('grade'),
+                "학년": grade_label,
                 "반": ", ".join(student.get("class_name", [])) if isinstance(student.get("class_name"), list) else student.get("class_name", ""),
+                "학교": student.get("school_name"),
                 "입소일자": start_val,
                 "퇴소일자": end_val,
                 "재원상태": "퇴원",
