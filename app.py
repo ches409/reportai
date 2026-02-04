@@ -2162,7 +2162,7 @@ class EnhancedDischargeReportGenerator:
                 "입소일자": start_val,
                 "퇴소일자": None,
                 "재원상태": "퇴원" if is_from_discharge else "재원중",
-                "재원기간": self._calculate_days_from(start_val),
+                "재원기간": "-" if is_from_discharge else self._calculate_days_from(start_val),
                 "퇴원사유": None,
                 "학부모전화": student.get("parent_phone_number"),
                 "_from_discharge": is_from_discharge
