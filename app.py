@@ -1,6 +1,5 @@
 import os
 import io
-import mimetypes
 import json
 import asyncio
 from datetime import datetime, timedelta
@@ -49,8 +48,8 @@ logger.setLevel(logging.DEBUG)
 
 # 프롬프트 템플릿 로드
 BASE_DIR = Path(__file__).resolve().parent
-filter_select_prompt_path = BASE_DIR / "filter_select_prompt"
-table_select_prompt_path = BASE_DIR / "table_select_prompt"
+filter_select_prompt_path = BASE_DIR / "prompts" / "filter_select_prompt"
+table_select_prompt_path = BASE_DIR / "prompts" / "table_select_prompt"
 
 with filter_select_prompt_path.open("r", encoding="utf-8") as f:
     FILTER_SELECT_PROMPT = f.read()
@@ -67,8 +66,6 @@ class Config:
     DB_CLASS: str = os.getenv("DB_CLASS", "")
     DB_REPORTREQUEST: str = os.getenv("DB_REPORTREQUEST", "")
     DB_DISCHARGE: str = os.getenv("DB_DISCHARGE", "")
-    DB_STUDENT: str = os.getenv("DB_STUDENT", "")
-    DB_GRADE_FORMULA: str = os.getenv("DB_GRADE_FORMULA", "")  # 내신 산출식 정보 DB
 
     OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://localhost:11434")
     OLLAMA_ENTITY_MODEL: str = os.getenv("OLLAMA_ENTITY_MODEL", "qwen3:8b")
@@ -143,9 +140,7 @@ class NotionManager:
         self.db_map = {
             "class": config.DB_CLASS,
             "report_requests": config.DB_REPORTREQUEST,
-            "discharge": config.DB_DISCHARGE,
-            "student": config.DB_STUDENT,
-            "grade_formula": config.DB_GRADE_FORMULA  # 내신 산출식 정보 DB
+            "discharge": config.DB_DISCHARGE
         }
 
     async def get_pending_requests(self) -> List[ReportRequest]:
@@ -1108,7 +1103,7 @@ class ExcelFileHandler:
             "discharge": []            
         }
         # 전처리 필터 키워드 (반명에 포함되면 제거)
-        self.filter_keywords = ["TEST", "면접", "자소서", "상담", "대입"]
+        self.filter_keywords = ["TEST", "면접", "자소서", "상담", "대입", "특"]
         # NotionManager (날짜 범위 조회용)
         self.notion = notion_manager
     
@@ -1446,6 +1441,9 @@ class ExcelFileHandler:
             if pd.isna(class_name_value):
                 return False
             class_name_upper = str(class_name_value).upper()
+            # "특목"은 예외: 포함되어도 제거하지 않음
+            if "특목" in class_name_upper:
+                return False
             for keyword in self.filter_keywords:
                 if keyword in class_name_upper:
                     return True
@@ -2140,16 +2138,18 @@ class EnhancedDischargeReportGenerator:
         for student in enrollments:
             # enrollments now use internal English keys; map to output Korean keys
             start_val = student.get("start_date")
+            is_from_discharge = bool(student.get("_from_discharge"))
             detailed_list.append({
                 "학생명": student.get("student_name"),
                 "학년": f"{student.get('grade')}학년" if isinstance(student.get('grade'), int) else student.get('grade'),
                 "반": student.get("class_name"),
                 "입소일자": start_val,
                 "퇴소일자": None,
-                "재원상태": "재원중",
+                "재원상태": "퇴원" if is_from_discharge else "재원중",
                 "재원기간": self._calculate_days_from(start_val),
                 "퇴원사유": None,
-                "학부모전화": student.get("parent_phone_number")
+                "학부모전화": student.get("parent_phone_number"),
+                "_from_discharge": is_from_discharge
             })
         
         # 2. 퇴소 학생 (discharge 테이블 - 입소일 + 퇴소일 있음)
@@ -2170,7 +2170,8 @@ class EnhancedDischargeReportGenerator:
                     end_val
                 ),
                 "퇴원사유": student.get("discharging_reason"),
-                "학부모전화": student.get("parent_phone_number")
+                "학부모전화": student.get("parent_phone_number"),
+                "_from_discharge": False
         })
         
         # 퇴소일자 기준 정렬 (퇴소일자가 없으면 입소일자 사용)
@@ -2314,8 +2315,17 @@ class EnhancedDischargeReportGenerator:
 
         
         
-        # 저장
-        output_path = Path("temp") / f"{filename}.xlsx"
+        # 저장 (동일 이름 충돌 방지)
+        output_dir = Path("temp")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{filename}.xlsx"
+        if output_path.exists():
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            counter = 1
+            while output_path.exists():
+                suffix = f"{timestamp}_{counter}"
+                output_path = output_dir / f"{filename}_{suffix}.xlsx"
+                counter += 1
         wb.save(output_path)
         
         logger.info(f"✅ 차트 포함 Excel 생성 완료: {output_path.name}")
@@ -2466,7 +2476,9 @@ class EnhancedDischargeReportGenerator:
                 subjects = [subject] if subject else ["기타"]
             
             for subj in subjects:
-                if student.get("재원상태") == "재원중":
+                if student.get("_from_discharge"):
+                    subject_enrollments[subj] += 1
+                elif student.get("재원상태") == "재원중":
                     subject_enrollments[subj] += 1
                 elif student.get("재원상태") == "퇴원":
                     subject_discharges[subj] += 1
@@ -2600,8 +2612,8 @@ class EnhancedDischargeReportGenerator:
         # detailed_list에서 퇴원한 학생들만 필터링
         detailed_list = report_data.get("detailed_list", [])
         discharged_students = [
-            student for student in detailed_list 
-            if student.get("재원상태") == "퇴원" and student.get("퇴소일자")
+            student for student in detailed_list
+            if student.get("재원상태") == "퇴원" and student.get("퇴소일자") and not student.get("_from_discharge")
         ]
         
         if not discharged_students:
@@ -2830,8 +2842,8 @@ class EnhancedDischargeReportGenerator:
         # detailed_list에서 퇴원한 학생들만 필터링
         detailed_list = report_data.get("detailed_list", [])
         discharged_students = [
-            student for student in detailed_list 
-            if student.get("재원상태") == "퇴원" and student.get("퇴소일자")
+            student for student in detailed_list
+            if student.get("재원상태") == "퇴원" and student.get("퇴소일자") and not student.get("_from_discharge")
         ]
         
         if not discharged_students:
@@ -3065,8 +3077,12 @@ class EnhancedDischargeReportGenerator:
             return
         
         # 입소 학생과 퇴소 학생으로 분리
-        enrolled_students = [s for s in detailed if s.get("재원상태") == "재원중"]
-        discharged_students = [s for s in detailed if s.get("재원상태") == "퇴원"]
+        enrolled_students = [
+            s for s in detailed if s.get("재원상태") == "재원중" or s.get("_from_discharge")
+        ]
+        discharged_students = [
+            s for s in detailed if s.get("재원상태") == "퇴원" and not s.get("_from_discharge")
+        ]
         
         # 퇴소 학생 재원기간 평균 계산
         discharged_durations = []
@@ -3119,7 +3135,7 @@ class EnhancedDischargeReportGenerator:
             # 퇴소 학생 섹션 제목
             ws.merge_cells(f'A{current_row}:{get_column_letter(discharged_cols)}{current_row}')
             section_title = ws[f'A{current_row}']
-            section_title.value = "📌 퇴소 학생"
+            section_title.value = "📌 퇴소 정보"
             section_title.font = Font(size=12, bold=True, color="FFFFFF")
             section_title.fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
             section_title.alignment = Alignment(horizontal="left")
@@ -3150,9 +3166,13 @@ class EnhancedDischargeReportGenerator:
                     cell.value = value if value is not None else "-"
                     cell.alignment = Alignment(horizontal="left")
                     
-                    # 재원상태 색상
+                    # 재원상태 색상 (값 기준)
                     if df_discharged.columns[col_num - 1] == "재원상태":
-                        cell.font = Font(color="FF0000", bold=True)
+                        status = str(value).strip()
+                        if status == "퇴원":
+                            cell.font = Font(color="FF0000", bold=True)
+                        elif status == "재원중":
+                            cell.font = Font(color="00B050", bold=True)
                     
                     # 스트라이프
                     if current_row % 2 == 0:
@@ -3168,7 +3188,7 @@ class EnhancedDischargeReportGenerator:
             enrolled_cols = len(df_enrolled.columns)
             ws.merge_cells(f'{get_column_letter(enrolled_start_col)}{3}:{get_column_letter(enrolled_start_col + enrolled_cols - 1)}{3}')
             section_title = ws[f'{get_column_letter(enrolled_start_col)}{3}']
-            section_title.value = "📌 입소 학생 (재원중)"
+            section_title.value = "📌 입소 정보 (재원중, 퇴원)"
             section_title.font = Font(size=12, bold=True, color="FFFFFF")
             section_title.fill = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
             section_title.alignment = Alignment(horizontal="left")
@@ -3199,9 +3219,13 @@ class EnhancedDischargeReportGenerator:
                     cell.value = value if value is not None else "-"
                     cell.alignment = Alignment(horizontal="left")
                     
-                    # 재원상태 색상
+                    # 재원상태 색상 (값 기준)
                     if df_enrolled.columns[col_num - 1] == "재원상태":
-                        cell.font = Font(color="00B050", bold=True)
+                        status = str(value).strip()
+                        if status == "퇴원":
+                            cell.font = Font(color="FF0000", bold=True)
+                        elif status == "재원중":
+                            cell.font = Font(color="00B050", bold=True)
                     
                     # 스트라이프
                     if data_row % 2 == 0:
@@ -3304,6 +3328,123 @@ class ReportOrchestrator:
         #self.security = SecurityManager()
         #self.file_manager = LocalFileManager()
     
+    def _merge_discharge_into_class(
+        self,
+        query_results: Dict[str, List[Dict]],
+        min_start_date: Optional[datetime] = None
+    ) -> Dict[str, List[Dict]]:
+        if not isinstance(query_results, dict):
+            return query_results
+
+        # Find actual keys (case-insensitive)
+        class_key = None
+        discharge_key = None
+        for key in query_results.keys():
+            if isinstance(key, str):
+                if key.lower() == "class":
+                    class_key = key
+                elif key.lower() == "discharge":
+                    discharge_key = key
+
+        class_list = query_results.get(class_key, []) if class_key else []
+        discharge_list = query_results.get(discharge_key, []) if discharge_key else []
+
+        if not isinstance(class_list, list):
+            class_list = []
+        if not isinstance(discharge_list, list):
+            discharge_list = []
+
+        if not discharge_list:
+            return query_results
+
+        def _norm_str(value: Any) -> str:
+            if value is None:
+                return ""
+            return str(value).strip().lower()
+
+        def _norm_grade(value: Any) -> Optional[int]:
+            if value is None:
+                return None
+            try:
+                if isinstance(value, (int, float)):
+                    return int(value)
+                if isinstance(value, str):
+                    match = re.search(r"\d+", value)
+                    if match:
+                        return int(match.group())
+                return None
+            except Exception:
+                return None
+
+        def _parse_date(value: Any) -> Optional[datetime]:
+            if value is None:
+                return None
+            try:
+                if isinstance(value, datetime):
+                    return value
+                value_str = str(value)
+                if "T" in value_str:
+                    value_str = value_str.split("T")[0]
+                return datetime.fromisoformat(value_str)
+            except Exception:
+                return None
+
+        existing_keys = set()
+        for row in class_list:
+            if not isinstance(row, dict):
+                continue
+            student_name = _norm_str(row.get("student_name"))
+            class_name = _norm_str(row.get("class_name"))
+            parent_phone = _norm_str(row.get("parent_phone_number"))
+            grade = _norm_grade(row.get("grade"))
+            start_date = _norm_str(row.get("start_date"))
+            if not student_name or not class_name or not parent_phone or grade is None or not start_date:
+                continue
+            existing_keys.add((student_name, class_name, grade, parent_phone, start_date))
+
+        added_count = 0
+        for row in discharge_list:
+            if not isinstance(row, dict):
+                continue
+            student_name = _norm_str(row.get("student_name"))
+            class_name = _norm_str(row.get("class_name"))
+            parent_phone = _norm_str(row.get("parent_phone_number"))
+            grade = _norm_grade(row.get("grade"))
+            start_date = _norm_str(row.get("start_date"))
+            if not student_name or not class_name or not parent_phone or grade is None or not start_date:
+                continue
+
+            if min_start_date:
+                parsed_start = _parse_date(row.get("start_date"))
+                if parsed_start and parsed_start < min_start_date:
+                    continue
+
+            key = (student_name, class_name, grade, parent_phone, start_date)
+            if key in existing_keys:
+                continue
+
+            class_list.append({
+                "student_name": row.get("student_name"),
+                "class_name": row.get("class_name"),
+                "grade": grade,
+                "parent_phone_number": row.get("parent_phone_number"),
+                "start_date": row.get("start_date"),
+                "_from_discharge": True,
+            })
+            existing_keys.add(key)
+            added_count += 1
+
+        if added_count:
+            logger.info(f"✅ discharge → class 보정 추가: {added_count}개")
+
+        # write back (ensure key exists)
+        if class_key:
+            query_results[class_key] = class_list
+        else:
+            query_results["class"] = class_list
+
+        return query_results
+    
     async def _process_discharge_report(self, query_results: Dict, query: ReportQuery):
         """입퇴소 보고서 (차트 포함)"""
         
@@ -3359,6 +3500,28 @@ class ReportOrchestrator:
             
             # 2. 쿼리 실행 및 데이터 수집
             query_results = await self.notion.query_multiple_tables(query)
+
+            # 보고서 연도 기준으로 discharge -> class 보정 범위 설정
+            min_start_date = None
+            q0 = query[0] if isinstance(query, list) and query else query
+            if q0 and q0.date_range:
+                try:
+                    start_str = q0.date_range.get("start")
+                    end_str = q0.date_range.get("end")
+                    date_str = start_str or end_str
+                    if date_str:
+                        if "T" in date_str:
+                            date_obj = datetime.fromisoformat(date_str.split("T")[0])
+                        else:
+                            date_obj = datetime.fromisoformat(date_str)
+                        # 월 단위 요청을 고려해 start가 있으면 그대로 사용, 없으면 end의 월 첫날 사용
+                        if start_str:
+                            min_start_date = date_obj
+                        else:
+                            min_start_date = datetime(date_obj.year, date_obj.month, 1)
+                except Exception:
+                    min_start_date = None
+            query_results = self._merge_discharge_into_class(query_results, min_start_date=min_start_date)
             
             # 3. 보고서 생성 및 전달
             await self._process_discharge_report(query_results, query)
