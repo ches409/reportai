@@ -94,10 +94,17 @@ OLLAMA_MODEL="qwen3:8b"
 
 ### 1-4. 서버 실행
 
-**가장 쉬운 방법: 배치 파일 사용 (권장)**
-- 프로젝트 폴더에서 `start_server.bat` 파일을 **더블클릭**합니다
-- 자동으로 가상환경을 활성화하고 서버를 실행합니다
-- 콘솔 창이 열리며 서버 상태를 확인할 수 있습니다
+**방법 1: 수동 실행 (고급 사용자)**
+- 가상환경이 활성화된 상태에서:
+  ```
+  python app.py
+  ```
+
+**방법 2: Python 스크립트 사용**
+- 명령 프롬프트에서 다음 명령어를 입력합니다:
+   ```
+   python start_server.py
+   ```
 
 **서버가 정상적으로 실행되면:**
 - 콘솔 창에 "🚀 학원 보고서 시스템 시작" 메시지가 나타납니다
@@ -109,22 +116,7 @@ OLLAMA_MODEL="qwen3:8b"
 - 콘솔 창에서 `Ctrl + C`를 누릅니다
 - 또는 콘솔 창을 닫습니다
 
-**다른 실행 방법:**
 
-**방법 2: Python 스크립트 사용**
-- 명령 프롬프트에서 다음 명령어를 입력합니다:
-  ```
-  python start_server.py
-  ```
-
-**방법 3: VS Code에서 실행**
-- VS Code 편집기 오른쪽 위의 **▶️ Run Python File** 버튼을 클릭합니다
-
-**방법 4: 수동 실행 (고급 사용자)**
-- 가상환경이 활성화된 상태에서:
-  ```
-  python app.py
-  ```
 
 ---
 
@@ -136,7 +128,6 @@ OLLAMA_MODEL="qwen3:8b"
 
 - `input/class/` - 입소 학생 데이터
 - `input/discharge/` - 퇴소 학생 데이터  
-- `input/student/` - 학생 기본 정보
 
 **파일 형식:**
 - `.xlsx` 또는 `.xls` 형식의 엑셀 파일
@@ -219,7 +210,7 @@ OLLAMA_MODEL="qwen3:8b"
 
 **생성된 보고서는 다음 위치에 저장됩니다:**
 - `temp/` 폴더
-- 파일명 형식: `discharge_chart_[선생님명]_[날짜시간].xlsx`
+- 파일명 형식: `[선생님명]_[입퇴소보고서]_[날짜시간(중복시)].xlsx`
 
 **보고서 내용:**
 - 월별 입퇴소 현황
@@ -253,7 +244,6 @@ https://www.notion.so/database-2d32f86d712c808fb36aeba2c43af21d
 **데이터베이스 종류:**
 - **class** - 입소 학생 데이터
 - **discharge** - 퇴소 학생 데이터
-- **student** - 학생 기본 정보
 
 ---
 
@@ -336,7 +326,7 @@ https://www.notion.so/database-2d32f86d712c808fb36aeba2c43af21d
 **확인 사항:**
 
 1. **파일 위치 확인**
-   - 파일이 올바른 폴더(`input/class/`, `input/discharge/`, `input/student/`)에 있는지 확인합니다
+   - 파일이 올바른 폴더(`input/class/`, `input/discharge/`)에 있는지 확인합니다
 
 2. **파일 형식 확인**
    - `.xlsx` 또는 `.xls` 형식인지 확인합니다
@@ -391,4 +381,4 @@ https://www.notion.so/database-2d32f86d712c808fb36aeba2c43af21d
 
 ---
 
-**마지막 업데이트: 2026년 1월**
+**마지막 업데이트: 2026년 2월**
