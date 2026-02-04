@@ -1,4 +1,6 @@
 import os
+import io
+import mimetypes
 import json
 import asyncio
 from datetime import datetime, timedelta
@@ -9,6 +11,8 @@ import logging
 import re
 import copy
 from collections import Counter
+import PIL.Image
+
 
 # 라이브러리
 from notion_client import AsyncClient as NotionClient
@@ -18,11 +22,13 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from weasyprint import HTML #pdf생성 라이브러리
+import fitz  # PyMuPDF (PDF 처리용)
+import pdfplumber
 import zipfile
 from cryptography.fernet import Fernet
 import boto3
 import requests
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File, HTTPException
 from pydantic import BaseModel
 import uvicorn
 import logging
@@ -54,6 +60,7 @@ with table_select_prompt_path.open("r", encoding="utf-8") as f:
 
 
 
+
 class Config:
     NOTION_TOKEN: str = os.getenv("NOTION_TOKEN", "")
 
@@ -61,10 +68,11 @@ class Config:
     DB_REPORTREQUEST: str = os.getenv("DB_REPORTREQUEST", "")
     DB_DISCHARGE: str = os.getenv("DB_DISCHARGE", "")
     DB_STUDENT: str = os.getenv("DB_STUDENT", "")
+    DB_GRADE_FORMULA: str = os.getenv("DB_GRADE_FORMULA", "")  # 내신 산출식 정보 DB
 
     OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://localhost:11434")
     OLLAMA_ENTITY_MODEL: str = os.getenv("OLLAMA_ENTITY_MODEL", "qwen3:8b")
-    OLLAMA_QUERY_MODEL: str = os.getenv("OLLAMA_QUERY_MODEL", "qwencoder:7b")
+
 
     TEMP_DIR = Path("temp")
     REPORTS_DIR = Path("reports")
@@ -136,7 +144,8 @@ class NotionManager:
             "class": config.DB_CLASS,
             "report_requests": config.DB_REPORTREQUEST,
             "discharge": config.DB_DISCHARGE,
-            "student": config.DB_STUDENT
+            "student": config.DB_STUDENT,
+            "grade_formula": config.DB_GRADE_FORMULA  # 내신 산출식 정보 DB
         }
 
     async def get_pending_requests(self) -> List[ReportRequest]:
@@ -208,7 +217,7 @@ class NotionManager:
                 row[col] = self._extract_property(page, col)
             data.append(row)
         
-        # 날짜 필터 추가 적용 (Notion API 필터가 완벽하지 않을 수 있으므로)
+        # 날짜 필터 적용
         if query.date_range and isinstance(query.date_range, dict) and query.date_range.get("property"):
             date_prop = query.date_range.get("property")
             start_val = query.date_range.get("start")
@@ -333,10 +342,52 @@ class NotionManager:
     def _build_filter(self, query: ReportQuery) -> Optional[Dict]:
         conditions = []
         
+        # number 타입으로 처리해야 하는 필드
+        number_fields = {"grade"}
+        
         # 일반 필터 처리
         if query.filters:
             for key, value in query.filters.items():
-                if isinstance(value, str):
+                # 제외 필터 처리
+                if isinstance(value, dict) and "exclude" in value:
+                    exclude_value = value["exclude"]
+                    # grade는 항상 number로 처리
+                    if key in number_fields:
+                        try:
+                            num_value = int(exclude_value) if isinstance(exclude_value, str) else exclude_value
+                            conditions.append({
+                                "property": key,
+                                "number": {"does_not_equal": num_value}
+                            })
+                        except (ValueError, TypeError):
+                            pass
+                    elif isinstance(exclude_value, str):
+                        conditions.append({
+                            "property": key,
+                            "rich_text": {"does_not_contain": exclude_value}
+                        })
+                    elif isinstance(exclude_value, (int, float)):
+                        conditions.append({
+                            "property": key,
+                            "number": {"does_not_equal": exclude_value}
+                        })
+                    elif isinstance(exclude_value, list):
+                        conditions.append({
+                            "property": key,
+                            "select": {"does_not_equal": exclude_value[0]}
+                        })
+                # 일반 필터 처리
+                # grade는 항상 number로 처리
+                elif key in number_fields:
+                    try:
+                        num_value = int(value) if isinstance(value, str) else value
+                        conditions.append({
+                            "property": key,
+                            "number": {"equals": num_value}
+                        })
+                    except (ValueError, TypeError):
+                        pass
+                elif isinstance(value, str):
                     conditions.append({
                         "property": key,
                         "rich_text": {"contains": value}
@@ -1036,6 +1087,7 @@ class OllamaAnalyzer:
                 target_table="class",
                 columns=["학생명", "담당", "반명"]
             )
+    
 
 
 ####
@@ -1048,14 +1100,12 @@ class ExcelFileHandler:
         self.queued_files = set()  # 큐에 추가된 파일 추적 (중복 큐 추가 방지)
         self.table_folders = {
             "class": self.input_dir / "class",
-            "discharge": self.input_dir / "discharge",
-            "student": self.input_dir / "student"
+            "discharge": self.input_dir / "discharge"            
         }
         # 각 폴더별로 읽은 파일들을 저장
         self.stored_files = {
             "class": [],
-            "discharge": [],
-            "student": []
+            "discharge": []            
         }
         # 전처리 필터 키워드 (반명에 포함되면 제거)
         self.filter_keywords = ["TEST", "면접", "자소서", "상담", "대입"]
@@ -2276,7 +2326,16 @@ class EnhancedDischargeReportGenerator:
         trend_info = report_data.get("yearly_trend", {})
         trend_data = trend_info.get("monthly_data", [])
         chart_type = trend_info.get("chart_type", "line")
-        month_count = len(trend_data)
+        if trend_data:
+            months = [(d["year"], d["month"]) for d in trend_data if "year" in d and "month" in d]
+            if months:
+                min_year, min_month = min(months)
+                max_year, max_month = max(months)
+                month_count = (max_year - min_year) * 12 + (max_month - min_month) + 1
+            else:
+                month_count = 0
+        else:
+            month_count = 0
         
         # 제목
         ws.merge_cells('A1:G1')
@@ -3589,7 +3648,7 @@ async def excel_file_watcher_worker():
             result = excel_handler.watch_and_store()
             
             # 각 폴더별로 처리
-            for table_type in ["class", "discharge", "student"]:
+            for table_type in ["class", "discharge"]:
                 if table_type in result and len(result[table_type]) > 0:
                     try:
                         logger.info(f"🔄 [{table_type}] 자동 처리 시작...")
@@ -3660,6 +3719,9 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+
 
 @app.get("/download/{date}/{filename}")
 async def download_file(date: str, filename: str):
