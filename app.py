@@ -66,8 +66,8 @@ class Config:
     DB_REPORTREQUEST: str = os.getenv("DB_REPORTREQUEST", "")
     DB_DISCHARGE: str = os.getenv("DB_DISCHARGE", "")
 
-    OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://localhost:11434")
-    OLLAMA_ENTITY_MODEL: str = os.getenv("OLLAMA_ENTITY_MODEL", "qwen3:8b")
+    OLLAMA_URL: str = os.getenv("OLLAMA_URL", "")
+    OLLAMA_ENTITY_MODEL: str = os.getenv("OLLAMA_ENTITY_MODEL", "")
 
 
     TEMP_DIR = Path("temp")
