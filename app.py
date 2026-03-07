@@ -20,7 +20,6 @@ import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from weasyprint import HTML #pdf생성 라이브러리
 import fitz  # PyMuPDF (PDF 처리용)
 import pdfplumber
 import zipfile
