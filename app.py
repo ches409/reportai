@@ -1,4 +1,5 @@
 import os
+import io
 import json
 import asyncio
 from datetime import datetime, timedelta
@@ -9,6 +10,8 @@ import logging
 import re
 import copy
 from collections import Counter
+import PIL.Image
+
 
 # 라이브러리
 from notion_client import AsyncClient as NotionClient
@@ -18,11 +21,13 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from weasyprint import HTML #pdf생성 라이브러리
+import fitz  # PyMuPDF (PDF 처리용)
+import pdfplumber
 import zipfile
 from cryptography.fernet import Fernet
 import boto3
 import requests
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File, HTTPException
 from pydantic import BaseModel
 import uvicorn
 import logging
@@ -43,14 +48,15 @@ logger.setLevel(logging.DEBUG)
 
 # 프롬프트 템플릿 로드
 BASE_DIR = Path(__file__).resolve().parent
-filter_select_prompt_path = BASE_DIR / "filter_select_prompt"
-table_select_prompt_path = BASE_DIR / "table_select_prompt"
+filter_select_prompt_path = BASE_DIR / "prompts" / "filter_select_prompt"
+table_select_prompt_path = BASE_DIR / "prompts" / "table_select_prompt"
 
 with filter_select_prompt_path.open("r", encoding="utf-8") as f:
     FILTER_SELECT_PROMPT = f.read()
 
 with table_select_prompt_path.open("r", encoding="utf-8") as f:
     TABLE_SELECT_PROMPT = f.read()
+
 
 
 
@@ -63,7 +69,7 @@ class Config:
 
     OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://localhost:11434")
     OLLAMA_ENTITY_MODEL: str = os.getenv("OLLAMA_ENTITY_MODEL", "qwen3:8b")
-    OLLAMA_QUERY_MODEL: str = os.getenv("OLLAMA_QUERY_MODEL", "qwencoder:7b")
+
 
     TEMP_DIR = Path("temp")
     REPORTS_DIR = Path("reports")
@@ -87,6 +93,7 @@ class Class:
     start_date: datetime
     school_name: str
     grade: int
+    type: str  # 특목, 본관 구분
 
 @dataclass
 class DISCHARGE:
@@ -101,6 +108,8 @@ class DISCHARGE:
     discharging_reason: str
     school_name: str
     grade: int
+    type: str  # 특목, 본관 구분
+
 
 
 @dataclass
@@ -203,7 +212,7 @@ class NotionManager:
                 row[col] = self._extract_property(page, col)
             data.append(row)
         
-        # 날짜 필터 추가 적용 (Notion API 필터가 완벽하지 않을 수 있으므로)
+        # 날짜 필터 적용
         if query.date_range and isinstance(query.date_range, dict) and query.date_range.get("property"):
             date_prop = query.date_range.get("property")
             start_val = query.date_range.get("start")
@@ -328,10 +337,52 @@ class NotionManager:
     def _build_filter(self, query: ReportQuery) -> Optional[Dict]:
         conditions = []
         
+        # number 타입으로 처리해야 하는 필드
+        number_fields = {"grade"}
+        
         # 일반 필터 처리
         if query.filters:
             for key, value in query.filters.items():
-                if isinstance(value, str):
+                # 제외 필터 처리
+                if isinstance(value, dict) and "exclude" in value:
+                    exclude_value = value["exclude"]
+                    # grade는 항상 number로 처리
+                    if key in number_fields:
+                        try:
+                            num_value = int(exclude_value) if isinstance(exclude_value, str) else exclude_value
+                            conditions.append({
+                                "property": key,
+                                "number": {"does_not_equal": num_value}
+                            })
+                        except (ValueError, TypeError):
+                            pass
+                    elif isinstance(exclude_value, str):
+                        conditions.append({
+                            "property": key,
+                            "rich_text": {"does_not_contain": exclude_value}
+                        })
+                    elif isinstance(exclude_value, (int, float)):
+                        conditions.append({
+                            "property": key,
+                            "number": {"does_not_equal": exclude_value}
+                        })
+                    elif isinstance(exclude_value, list):
+                        conditions.append({
+                            "property": key,
+                            "select": {"does_not_equal": exclude_value[0]}
+                        })
+                # 일반 필터 처리
+                # grade는 항상 number로 처리
+                elif key in number_fields:
+                    try:
+                        num_value = int(value) if isinstance(value, str) else value
+                        conditions.append({
+                            "property": key,
+                            "number": {"equals": num_value}
+                        })
+                    except (ValueError, TypeError):
+                        pass
+                elif isinstance(value, str):
                     conditions.append({
                         "property": key,
                         "rich_text": {"contains": value}
@@ -347,36 +398,7 @@ class NotionManager:
                         "select": {"equals": value[0]}
                     })
         
-        # 날짜 범위: AI가 날짜 속성명을 명시한 경우에만 사용
-        if query.date_range and isinstance(query.date_range, dict) and query.date_range.get("property"):
-            date_prop = query.date_range.get("property")
-            start_val = query.date_range.get("start")
-            end_val = query.date_range.get("end")
-            
-            # 시작일과 종료일을 별도의 조건으로 분리
-            if start_val:
-                start_cond = {
-                    "property": date_prop,
-                    "date": {
-                        "on_or_after": start_val
-                    }
-                }
-                conditions.append(start_cond)
-                logger.info(f"📅 날짜 필터 생성 (시작): {date_prop} >= {start_val}")
-            
-            if end_val:
-                end_cond = {
-                    "property": date_prop,
-                    "date": {
-                        "on_or_before": end_val
-                    }
-                }
-                conditions.append(end_cond)
-                logger.info(f"📅 날짜 필터 생성 (종료): {date_prop} <= {end_val}")
-        else:
-            # date_range가 존재하지만 property가 누락된 경우 필터 추가를 건너뜁니다.
-            if query.date_range and isinstance(query.date_range, dict) and not query.date_range.get("property"):
-                logger.debug("_build_filter: date_range provided without 'property' — skipping date filter")
+        # 날짜 필터는 query_table에서 처리 (Notion API 필터가 완벽하지 않을 수 있으므로)
         
         # 조건이 하나도 없으면 None 반환
         if len(conditions) == 0:
@@ -452,6 +474,88 @@ class NotionManager:
         if p.get("rich_text"):
             return p["rich_text"][0]["plain_text"].strip()
         return ""
+    
+    async def get_date_range_from_table(self, table_name: str, date_property: Optional[str] = None) -> Optional[Tuple[datetime, datetime]]:
+        """테이블에서 날짜 범위 조회 (첫 날짜와 마지막 날짜)
+        
+        Args:
+            table_name: 테이블 이름 (class, discharge, student)
+            date_property: 날짜 속성명 (None이면 자동 결정)
+                - class, student: start_date
+                - discharge: discharge_date
+        
+        Returns:
+            (첫 날짜, 마지막 날짜) 튜플 또는 None (데이터가 없을 경우)
+        """
+        db_id = self.db_map.get(table_name.lower())
+        if not db_id:
+            logger.error(f"❌ 테이블을 찾을 수 없음: {table_name}")
+            return None
+        
+        # 날짜 속성 자동 결정
+        if not date_property:
+            if table_name.lower() in ["class", "student"]:
+                date_property = "start_date"
+            elif table_name.lower() == "discharge":
+                date_property = "discharge_date"
+            else:
+                logger.error(f"❌ 알 수 없는 테이블 타입: {table_name}")
+                return None
+        
+        try:
+            # 첫 번째 날짜 조회 (오름차순)
+            first_result = await self.client.databases.query(
+                database_id=db_id,
+                sorts=[{"property": date_property, "direction": "ascending"}],
+                page_size=1
+            )
+            
+            # 마지막 날짜 조회 (내림차순)
+            last_result = await self.client.databases.query(
+                database_id=db_id,
+                sorts=[{"property": date_property, "direction": "descending"}],
+                page_size=1
+            )
+            
+            first_date = None
+            last_date = None
+            
+            if first_result.get('results') and len(first_result['results']) > 0:
+                first_date_str = self._get_date(first_result['results'][0], date_property)
+                if first_date_str:
+                    try:
+                        if "T" in first_date_str:
+                            first_date = datetime.fromisoformat(first_date_str.split("T")[0])
+                        else:
+                            first_date = datetime.fromisoformat(first_date_str)
+                    except Exception as e:
+                        logger.error(f"❌ 첫 날짜 파싱 실패: {e}")
+            
+            if last_result.get('results') and len(last_result['results']) > 0:
+                last_date_str = self._get_date(last_result['results'][0], date_property)
+                if last_date_str:
+                    try:
+                        if "T" in last_date_str:
+                            last_date = datetime.fromisoformat(last_date_str.split("T")[0])
+                        else:
+                            last_date = datetime.fromisoformat(last_date_str)
+                    except Exception as e:
+                        logger.error(f"❌ 마지막 날짜 파싱 실패: {e}")
+            
+            if first_date and last_date:
+                logger.info(f"📅 [{table_name}] 날짜 범위: {first_date.date()} ~ {last_date.date()}")
+                return (first_date, last_date)
+            elif first_date:
+                # 데이터가 하나만 있는 경우
+                logger.info(f"📅 [{table_name}] 날짜: {first_date.date()}")
+                return (first_date, first_date)
+            else:
+                logger.info(f"📭 [{table_name}] 테이블에 데이터가 없습니다.")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ 날짜 범위 조회 실패: {e}")
+            return None
 
 
 
@@ -468,9 +572,9 @@ class OllamaAnalyzer:
         question_lower = question.lower()
         now = datetime.now()
         
-        # "X년 Y월부터 Z월까지" 형식 처리 (예: "2025년 3월부터 7월까지")
-        # 더 유연한 패턴: "부터"와 "까지" 사이에 공백이나 다른 문자가 있어도 매칭
-        month_range_match = re.search(r'(\d{4})\s*년\s*(\d{1,2})\s*월\s*부터.*?(\d{1,2})\s*월\s*까지', question)
+        # "X년 Y월부터 Z월까지" 형식 처리 (예: "2025년 3월부터 7월까지", "2025년 유형신 선생님 3월부터 7월까지")
+        # 더 유연한 패턴: 년도와 첫 번째 월 사이, "부터"와 "까지" 사이에 어떤 텍스트가 있어도 매칭
+        month_range_match = re.search(r'(\d{4})\s*년.*?(\d{1,2})\s*(?:월\s*)?부터.*?(\d{1,2})\s*(?:월\s*)까지', question)
         if month_range_match:
             year = int(month_range_match.group(1))
             start_month = int(month_range_match.group(2))
@@ -488,8 +592,9 @@ class OllamaAnalyzer:
             logger.info(f"📅 날짜 범위 파싱 (월 범위): {year}년 {start_month}월 ~ {end_month}월 → {result['start']} ~ {result['end']}")
             return result
         
-        # "X년 Y월부터" 형식 처리 (예: "2025년 3월부터")
-        month_start_match = re.search(r'(\d{4})\s*년\s*(\d{1,2})\s*월\s*부터', question)
+        # "X년 Y월부터" 형식 처리 (예: "2025년 3월부터", "2025년 유형신 선생님 3월부터")
+        # 년도와 월 사이에 어떤 텍스트가 있어도 매칭
+        month_start_match = re.search(r'(\d{4})\s*년.*?(\d{1,2})\s*월\s*부터', question)
         if month_start_match:
             year = int(month_start_match.group(1))
             start_month = int(month_start_match.group(2))
@@ -503,8 +608,9 @@ class OllamaAnalyzer:
                 "end": end_date.strftime("%Y-%m-%d")
             }
         
-        # "X년 Y월" 형식 처리 (예: "2025년 3월")
-        single_month_match = re.search(r'(\d{4})\s*년\s*(\d{1,2})\s*월\s*(?!부터|까지)', question)
+        # "X년 Y월" 형식 처리 (예: "2025년 3월", "2025년 유형신 선생님 3월")
+        # 년도와 월 사이에 어떤 텍스트가 있어도 매칭 (단, "부터"나 "까지"가 바로 뒤에 오는 경우는 제외)
+        single_month_match = re.search(r'(\d{4})\s*년.*?(\d{1,2})\s*월\s*(?!부터|까지)', question)
         if single_month_match:
             year = int(single_month_match.group(1))
             month = int(single_month_match.group(2))
@@ -606,13 +712,7 @@ class OllamaAnalyzer:
                 "end": end_date.strftime("%Y-%m-%d")
             }
         
-        # 날짜가 명시되지 않았지만 통계/현황 질문인 경우 -> 올해 전체
-        if any(keyword in question_lower for keyword in ["통계", "현황", "추이", "요약"]):
-            year = now.year
-            return {
-                "start": f"{year}-01-01",
-                "end": f"{year}-12-31"
-            }
+        
         
         # 기본값: 날짜 범위 없음
         return None
@@ -792,9 +892,9 @@ class OllamaAnalyzer:
         
         # 테이블별 기본 컬럼
         if table_type == "class":
-            base_columns.extend(["student_name", "start_date", "grade", "class_name", "parent_phone_number"])
+            base_columns.extend(["student_name", "start_date", "grade", "class_name", "parent_phone_number", "school_name"])
         elif table_type == "discharge":
-            base_columns.extend(["student_name", "grade", "class_name", "discharge_date", "start_date", "discharging_reason", "parent_phone_number"])
+            base_columns.extend(["student_name", "grade", "class_name", "discharge_date", "start_date", "discharging_reason", "parent_phone_number", "school_name"])
         
         # 질문에서 명시적으로 언급된 컬럼 확인
         column_keywords = {
@@ -982,11 +1082,900 @@ class OllamaAnalyzer:
                 target_table="class",
                 columns=["학생명", "담당", "반명"]
             )
+    
 
 
 ####
+class ExcelFileHandler:
+    """input 폴더의 엑셀 파일을 감지하고 폴더별로 구별해서 저장하는 클래스"""
+    
+    def __init__(self, notion_manager: Optional[NotionManager] = None):
+        self.input_dir = Path("input")
+        self.processed_files = set()  # 처리된 파일 추적 (중복 방지)
+        self.queued_files = set()  # 큐에 추가된 파일 추적 (중복 큐 추가 방지)
+        self.table_folders = {
+            "class": self.input_dir / "class",
+            "discharge": self.input_dir / "discharge"            
+        }
+        # 각 폴더별로 읽은 파일들을 저장
+        self.stored_files = {
+            "class": [],
+            "discharge": []            
+        }
+        # 전처리 필터 키워드 (반명에 포함되면 제거)
+        self.filter_keywords = ["TEST", "면접", "자소서", "상담", "대입", "특"]
+        # NotionManager (날짜 범위 조회용)
+        self.notion = notion_manager
+    
+    def _read_excel_file(self, file_path: Path) -> Optional[pd.DataFrame]:
+        """엑셀 파일을 읽어서 DataFrame으로 반환 (빈 행 제외)"""
+        try:
+            logger.info(f"📖 엑셀 파일 읽기 시작: {file_path.name}")
+            
+            # 엑셀 파일 읽기
+            df = pd.read_excel(file_path)
+            
+            if df.empty:
+                logger.warning(f"⚠️ 빈 엑셀 파일: {file_path.name}")
+                return None
+            
+            # 빈 행 제거 (모든 컬럼이 NaN인 행)
+            before_count = len(df)
+            df = df.dropna(how='all')  # 모든 값이 NaN인 행 제거
+            
+            if len(df) < before_count:
+                logger.info(f"🗑️ 빈 행 {before_count - len(df)}개 제거됨")
+            
+            # 빈 열 제거 (모든 값이 NaN인 열)
+            df = df.dropna(axis=1, how='all')
+            
+            if df.empty:
+                logger.warning(f"⚠️ 빈 행 제거 후 데이터가 없음: {file_path.name}")
+                return None
+            
+            logger.info(f"✅ 엑셀 파일 읽기 완료: {file_path.name} ({len(df)}개 행)")
+            return df
+            
+        except Exception as e:
+            logger.error(f"❌ 엑셀 파일 읽기 실패: {file_path.name}, 오류: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+    
+    def watch_and_store(self) -> Dict[str, List[Dict[str, Any]]]:
+        """input 폴더를 스캔하여 새 엑셀 파일을 감지하고 폴더별로 구별해서 저장
+        
+        Returns:
+            Dict[str, List[Dict]]: 폴더별로 저장된 파일 정보
+                예: {
+                    "class": [
+                        {"file_name": "class1.xlsx", "file_path": "input/class/class1.xlsx", "dataframe": df1},
+                        {"file_name": "class2.xlsx", "file_path": "input/class/class2.xlsx", "dataframe": df2}
+                    ],
+                    "discharge": [
+                        {"file_name": "discharge1.xlsx", "file_path": "input/discharge/discharge1.xlsx", "dataframe": df3}
+                    ],
+                    "student": []
+                }
+        """
+        # input 폴더가 없으면 생성
+        if not self.input_dir.exists():
+            self.input_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"📁 input 폴더 생성: {self.input_dir}")
+        
+        new_files_count = 0
+        
+        # 각 테이블별 폴더 확인 및 파일 읽기
+        for table_type, folder_path in self.table_folders.items():
+            logger.info(f"📂 [{table_type}] 폴더 스캔 중: {folder_path}")
+            
+            if not folder_path.exists():
+                folder_path.mkdir(parents=True, exist_ok=True)
+                logger.info(f"📁 {table_type} 폴더 생성: {folder_path}")
+                continue
+            
+            # 엑셀 파일 찾기
+            excel_files = list(folder_path.glob("*.xlsx")) + list(folder_path.glob("*.xls"))
+            logger.info(f"📋 [{table_type}] 폴더에서 {len(excel_files)}개 엑셀 파일 발견")
+            
+            for excel_file in excel_files:
+                # 파일 경로를 키로 사용하여 처리 여부 확인
+                file_key = str(excel_file.resolve())
+                
+                # 이미 처리되었거나 큐에 추가된 파일은 건너뜀
+                if file_key in self.processed_files:
+                    logger.debug(f"⏭️ [{table_type}] 이미 처리된 파일 건너뜀: {excel_file.name}")
+                    continue
+                
+                if file_key in self.queued_files:
+                    logger.debug(f"⏭️ [{table_type}] 이미 큐에 추가된 파일 건너뜀: {excel_file.name}")
+                    continue
+                
+                # 이미 stored_files에 있는 파일인지 확인 (같은 파일이 여러 번 스캔되는 것 방지)
+                already_stored = False
+                for stored_file in self.stored_files[table_type]:
+                    if stored_file.get("file_key") == file_key:
+                        already_stored = True
+                        break
+                
+                if already_stored:
+                    logger.debug(f"⏭️ [{table_type}] 이미 저장된 파일 건너뜀: {excel_file.name}")
+                    continue
+                
+                # 엑셀 파일 읽기
+                df = self._read_excel_file(excel_file)
+                
+                if df is not None:
+                    # 상대 경로 생성 (안전하게)
+                    try:
+                        file_path_str = str(excel_file.resolve().relative_to(Path.cwd().resolve()))
+                    except ValueError:
+                        # 상대 경로 변환 실패 시 절대 경로 사용
+                        file_path_str = str(excel_file.resolve())
+                    
+                    file_info = {
+                        "file_name": excel_file.name,
+                        "file_path": file_path_str,
+                        "file_key": file_key,  # 파일 키 추가
+                        "folder": table_type,
+                        "dataframe": df,
+                        "rows": len(df),
+                        "columns": list(df.columns),
+                        "read_time": datetime.now().isoformat()
+                    }
+                    # 폴더별로 구별해서 저장
+                    self.stored_files[table_type].append(file_info)
+                    # 파일을 읽은 즉시 processed_files에 추가하여 다음 스캔에서 건너뛰도록 함
+                    # (파일 이동 후에도 다시 추가되지만, 이미 processed_files에 있으면 건너뜀)
+                    self.processed_files.add(file_key)
+                    new_files_count += 1
+                    logger.info(f"✅ [{table_type}] 파일 저장 완료: {excel_file.name} ({len(df)}개 행)")
+                else:
+                    logger.warning(f"⚠️ [{table_type}] 파일 읽기 실패: {excel_file.name}")
+        
+        # 폴더별 요약 로그
+        for table_type, files in self.stored_files.items():
+            if files:
+                logger.info(f"📊 [{table_type}] 폴더: 총 {len(files)}개 파일 저장됨")
+        
+        if new_files_count > 0:
+            logger.info(f"🎉 새로 감지된 파일: {new_files_count}개")
+        else:
+            logger.info("💤 새로운 파일이 없습니다.")
+        
+        return self.stored_files
+    
+    async def preprocess_and_merge(self, table_type: str) -> Optional[pd.DataFrame]:
+        """저장된 파일들을 합치고 중복 제거 및 날짜 필터링
+        
+        Args:
+            table_type: 테이블 타입 (class, discharge, student)
+        
+        Returns:
+            전처리된 DataFrame (합쳐지고 중복 제거, 날짜 필터링됨) 또는 None
+        """
+        if table_type not in self.stored_files:
+            logger.error(f"❌ 알 수 없는 테이블 타입: {table_type}")
+            return None
+        
+        file_list = self.stored_files[table_type]
+        
+        if not file_list:
+            logger.warning(f"⚠️ [{table_type}] 폴더에 저장된 파일이 없습니다.")
+            return None
+        
+        logger.info(f"🔄 [{table_type}] 전처리 시작: {len(file_list)}개 파일 합치기")
+        
+        # 모든 DataFrame 합치기
+        dataframes = []
+        for file_info in file_list:
+            df = file_info.get("dataframe")
+            if df is not None and not df.empty:
+                # 원본 파일 정보를 컬럼으로 추가 (선택적)
+                df_copy = df.copy()
+                dataframes.append(df_copy)
+                logger.debug(f"  - {file_info['file_name']}: {len(df)}개 행 추가")
+        
+        if not dataframes:
+            logger.warning(f"⚠️ [{table_type}] 합칠 수 있는 데이터가 없습니다.")
+            return None
+        
+        # 모든 DataFrame 합치기
+        merged_df = pd.concat(dataframes, ignore_index=True)
+        original_count = len(merged_df)
+        logger.info(f"📊 [{table_type}] 합친 데이터: {original_count}개 행")
+        
+        # 중복 제거
+        # 모든 컬럼이 동일한 행을 중복으로 간주
+        deduplicated_df = merged_df.drop_duplicates(keep='first')
+        removed_count = original_count - len(deduplicated_df)
+        
+        if removed_count > 0:
+            logger.info(f"🗑️ [{table_type}] 중복 제거: {removed_count}개 행 제거됨 ({original_count} → {len(deduplicated_df)})")
+        else:
+            logger.info(f"✅ [{table_type}] 중복 데이터 없음")
+        
+        # 반명 필터링 (TEST, 면접, 자소서, 상담, 대입 포함된 데이터 제거)
+        before_filter_count = len(deduplicated_df)
+        filtered_df = self._filter_by_class_name(deduplicated_df)
+        filter_removed_count = before_filter_count - len(filtered_df)
+        
+        if filter_removed_count > 0:
+            logger.info(f"🔍 [{table_type}] 반명 필터링: {filter_removed_count}개 행 제거됨 (필터 키워드: {self.filter_keywords})")
+        else:
+            logger.info(f"✅ [{table_type}] 반명 필터링: 제거된 데이터 없음")
+        
+        # 날짜 필터링 (Notion에 있는 날짜 범위 제외)
+        before_date_filter_count = len(filtered_df)
+        date_filtered_df = await self._filter_by_notion_date_range(filtered_df, table_type)
+        #date_filtered_df = filtered_df
+        date_filter_removed_count = before_date_filter_count - len(date_filtered_df)
+        
+        if date_filter_removed_count > 0:
+            logger.info(f"📅 [{table_type}] 날짜 필터링: {date_filter_removed_count}개 행 제거됨 (Notion 날짜 범위 제외)")
+        else:
+            logger.info(f"✅ [{table_type}] 날짜 필터링: 제거된 데이터 없음")
+        
+        logger.info(f"✅ [{table_type}] 전처리 완료: 최종 {len(date_filtered_df)}개 행 (원본: {original_count} → 중복제거: {before_filter_count} → 반명필터: {before_date_filter_count} → 날짜필터: {len(date_filtered_df)})")
+        
+        return date_filtered_df
+    
+    async def _filter_by_notion_date_range(self, df: pd.DataFrame, table_type: str) -> pd.DataFrame:
+        """Notion의 날짜 범위에 포함된 데이터 제거
+        
+        Args:
+            df: 필터링할 DataFrame
+            table_type: 테이블 타입 (class, discharge, student)
+        
+        Returns:
+            날짜 범위 밖의 데이터만 남은 DataFrame
+        """
+        if df.empty:
+            return df
+        
+        if not self.notion:
+            logger.warning("⚠️ NotionManager가 설정되지 않아 날짜 필터링을 건너뜁니다.")
+            return df
+        
+        # 날짜 속성명 결정
+        date_property = None
+        if table_type in ["class", "student"]:
+            date_property = "start_date"
+        elif table_type == "discharge":
+            date_property = "discharge_date"
+        else:
+            logger.warning(f"⚠️ 알 수 없는 테이블 타입: {table_type}, 날짜 필터링 건너뜀")
+            return df
+        
+        # Notion에서 날짜 범위 조회
+        date_range = await self.notion.get_date_range_from_table(table_type, date_property)
+        
+        if not date_range:
+            logger.info(f"📭 [{table_type}] Notion에 데이터가 없어 전체 데이터를 유지합니다.")
+            return df
+        
+        first_date, last_date = date_range
+        logger.info(f"📅 [{table_type}] Notion 날짜 범위: {first_date.date()} ~ {last_date.date()}")
+        
+        # 날짜 컬럼 찾기 (더 유연하게)
+        date_col = None
+        for col in df.columns:
+            col_str = str(col).strip()
+            col_lower = col_str.lower()
+            
+            if date_property == "start_date":
+                # 입소일자 관련 키워드
+                if any(keyword in col_str for keyword in ['입소일자', '입소일', '입소 날짜', '시작일', '시작 날짜']):
+                    date_col = col
+                    break
+                elif 'start_date' in col_lower or 'startdate' in col_lower:
+                    date_col = col
+                    break
+                elif '날짜' in col_str and any(keyword in col_str for keyword in ['입소', '시작']):
+                    date_col = col
+                    break
+            elif date_property == "discharge_date":
+                # 퇴소일자 관련 키워드
+                if any(keyword in col_str for keyword in ['퇴소일자', '퇴소일', '퇴원일자', '퇴원일', '퇴소 날짜', '퇴원 날짜']):
+                    date_col = col
+                    break
+                elif 'discharge_date' in col_lower or 'dischargedate' in col_lower:
+                    date_col = col
+                    break
+                elif '날짜' in col_str and any(keyword in col_str for keyword in ['퇴소', '퇴원']):
+                    date_col = col
+                    break
+        
+        if not date_col:
+            # 디버깅: 사용 가능한 컬럼명 출력
+            available_cols = [str(col) for col in df.columns]
+            logger.warning(f"⚠️ [{table_type}] 날짜 컬럼을 찾을 수 없어 날짜 필터링을 건너뜁니다.")
+            logger.debug(f"   사용 가능한 컬럼: {available_cols}")
+            logger.debug(f"   찾는 날짜 속성: {date_property}")
+            return df
+        
+        # 날짜 컬럼을 datetime으로 변환
+        try:
+            df[date_col] = pd.to_datetime(df[date_col])
+        except Exception as e:
+            logger.error(f"❌ 날짜 컬럼 변환 실패: {e}")
+            return df
+        
+        # 날짜 범위 밖의 데이터만 남기기 (범위 내 데이터 제거)
+        # first_date <= 날짜 <= last_date 범위의 데이터 제거
+        before_count = len(df)
+        filtered_df = df[(df[date_col] < first_date) | (df[date_col] > last_date)]
+        removed_count = before_count - len(filtered_df)
+        
+        if removed_count > 0:
+            logger.info(f"🗑️ [{table_type}] 날짜 범위 내 데이터 {removed_count}개 제거됨 ({first_date.date()} ~ {last_date.date()})")
+        
+        return filtered_df.reset_index(drop=True)
+    
+    def _filter_by_class_name(self, df: pd.DataFrame) -> pd.DataFrame:
+        """반명에 필터 키워드가 포함된 행 제거
+        
+        Args:
+            df: 전처리할 DataFrame
+        
+        Returns:
+            필터링된 DataFrame
+        """
+        if df.empty:
+            return df
+        
+        # 반명 컬럼 찾기 (유연하게)
+        class_name_col = None
+        for col in df.columns:
+            col_lower = str(col).lower()
+            if '반명' in col_lower or 'class_name' in col_lower or '반' in col_lower:
+                class_name_col = col
+                break
+        
+        if not class_name_col:
+            logger.warning("⚠️ 반명 컬럼을 찾을 수 없어 필터링을 건너뜁니다.")
+            return df
+        
+        # 필터링: 반명에 키워드가 포함된 행 제거
+        def should_filter_row(class_name_value):
+            if pd.isna(class_name_value):
+                return False
+            class_name_upper = str(class_name_value).upper()
+            # "특목"은 예외: 포함되어도 제거하지 않음
+            if "특목" in class_name_upper:
+                return False
+            for keyword in self.filter_keywords:
+                if keyword in class_name_upper:
+                    return True
+            return False
+        
+        filtered_df = df[~df[class_name_col].apply(should_filter_row)]
+        
+        return filtered_df.reset_index(drop=True)
+    
+    async def preprocess_all_folders(self) -> Dict[str, Optional[pd.DataFrame]]:
+        """모든 폴더의 파일들을 전처리 (합치기 + 중복 제거 + 날짜 필터링)
+        
+        Returns:
+            Dict[str, Optional[pd.DataFrame]]: 폴더별 전처리된 DataFrame
+        """
+        result = {}
+        
+        for table_type in ["class", "discharge", "student"]:
+            result[table_type] = await self.preprocess_and_merge(table_type)
+        
+        return result
+    
+    def get_stored_files(self, table_type: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
+        """저장된 파일 정보 조회
+        
+        Args:
+            table_type: 특정 테이블 타입만 조회 (None이면 전체)
+        
+        Returns:
+            폴더별로 저장된 파일 정보
+        """
+        if table_type:
+            return {table_type: self.stored_files.get(table_type, [])}
+        return self.stored_files.copy()
+    
+    def clear_stored_files(self, table_type: Optional[str] = None):
+        """저장된 파일 정보 초기화
+        
+        Args:
+            table_type: 특정 테이블 타입만 초기화 (None이면 전체)
+        """
+        if table_type:
+            if table_type in self.stored_files:
+                self.stored_files[table_type] = []
+                logger.info(f"🔄 [{table_type}] 폴더의 저장된 파일 정보 초기화 완료")
+        else:
+            for table_type in self.stored_files:
+                self.stored_files[table_type] = []
+            logger.info("🔄 모든 폴더의 저장된 파일 정보 초기화 완료")
+    
+    def reset_processed_files(self):
+        """처리된 파일 목록 초기화 (모든 파일을 다시 읽을 수 있도록)"""
+        self.processed_files.clear()
+        self.queued_files.clear()  # 큐 목록도 함께 초기화
+        logger.info("🔄 처리된 파일 목록 및 큐 목록 초기화 완료")
+    
+    def move_processed_files_to_imported(self, table_type: str) -> int:
+        """처리된 파일들을 imported 폴더로 이동
+        
+        Args:
+            table_type: 테이블 타입 (class, discharge, student)
+        
+        Returns:
+            이동된 파일 수
+        """
+        if table_type not in self.stored_files:
+            logger.error(f"❌ 알 수 없는 테이블 타입: {table_type}")
+            return 0
+        
+        file_list = self.stored_files[table_type]
+        if not file_list:
+            logger.warning(f"⚠️ [{table_type}] 이동할 파일이 없습니다.")
+            return 0
+        
+        # imported 폴더 생성
+        imported_dir = self.input_dir / "imported" / table_type
+        imported_dir.mkdir(parents=True, exist_ok=True)
+        
+        moved_count = 0
+        
+        for file_info in file_list:
+            try:
+                file_path = Path(file_info["file_path"])
+                file_key = file_info.get("file_key")
+                
+                # 절대 경로로 변환
+                if not file_path.is_absolute():
+                    file_path = Path.cwd() / file_path
+                
+                if not file_path.exists():
+                    logger.warning(f"⚠️ 파일이 존재하지 않음: {file_path}")
+                    # 파일이 없어도 추적 목록에서 제거
+                    if file_key:
+                        self.queued_files.discard(file_key)
+                        self.processed_files.add(file_key)
+                    continue
+                
+                # imported 폴더로 이동할 파일명 생성 (타임스탬프 추가로 중복 방지)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                file_name = file_path.name
+                name_parts = file_name.rsplit('.', 1)
+                if len(name_parts) == 2:
+                    new_file_name = f"{name_parts[0]}_{timestamp}.{name_parts[1]}"
+                else:
+                    new_file_name = f"{file_name}_{timestamp}"
+                
+                dest_path = imported_dir / new_file_name
+                
+                # 파일 이동
+                file_path.rename(dest_path)
+                moved_count += 1
+                logger.info(f"📦 [{table_type}] 파일 이동: {file_path.name} → {dest_path}")
+                
+                # 파일 이동 성공 시 추적 목록 업데이트
+                if file_key:
+                    self.queued_files.discard(file_key)  # 큐 목록에서 제거
+                    self.processed_files.add(file_key)  # 처리 완료 목록에 추가
+                
+            except Exception as e:
+                logger.error(f"❌ [{table_type}] 파일 이동 실패: {file_info['file_name']}, 오류: {e}")
+        
+        if moved_count > 0:
+            logger.info(f"✅ [{table_type}] {moved_count}개 파일을 imported 폴더로 이동 완료")
+            # 이동된 파일은 stored_files에서 제거
+            self.stored_files[table_type] = []
+        
+        return moved_count
+    
+    def move_specific_files_to_imported(self, table_type: str, file_infos: List[Dict[str, Any]]) -> int:
+        """특정 파일들만 imported 폴더로 이동
+        
+        Args:
+            table_type: 테이블 타입 (class, discharge, student)
+            file_infos: 이동할 파일 정보 목록
+        
+        Returns:
+            이동된 파일 수
+        """
+        if table_type not in self.stored_files:
+            logger.error(f"❌ 알 수 없는 테이블 타입: {table_type}")
+            return 0
+        
+        if not file_infos:
+            logger.warning(f"⚠️ [{table_type}] 이동할 파일 정보가 없습니다.")
+            return 0
+        
+        # imported 폴더 생성
+        imported_dir = self.input_dir / "imported" / table_type
+        imported_dir.mkdir(parents=True, exist_ok=True)
+        
+        moved_count = 0
+        moved_file_keys = set()
+        
+        for file_info in file_infos:
+            try:
+                file_path = Path(file_info["file_path"])
+                file_key = file_info.get("file_key")
+                
+                # 절대 경로로 변환
+                if not file_path.is_absolute():
+                    file_path = Path.cwd() / file_path
+                
+                if not file_path.exists():
+                    logger.warning(f"⚠️ 파일이 존재하지 않음: {file_path}")
+                    # 파일이 없어도 추적 목록에서 제거
+                    if file_key:
+                        self.queued_files.discard(file_key)
+                        self.processed_files.add(file_key)
+                        moved_file_keys.add(file_key)
+                    continue
+                
+                # imported 폴더로 이동할 파일명 생성 (타임스탬프 추가로 중복 방지)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                file_name = file_path.name
+                name_parts = file_name.rsplit('.', 1)
+                if len(name_parts) == 2:
+                    new_file_name = f"{name_parts[0]}_{timestamp}.{name_parts[1]}"
+                else:
+                    new_file_name = f"{file_name}_{timestamp}"
+                
+                dest_path = imported_dir / new_file_name
+                
+                # 파일 이동
+                file_path.rename(dest_path)
+                moved_count += 1
+                logger.info(f"📦 [{table_type}] 파일 이동: {file_path.name} → {dest_path}")
+                
+                # 파일 이동 성공 시 추적 목록 업데이트
+                if file_key:
+                    self.queued_files.discard(file_key)  # 큐 목록에서 제거
+                    self.processed_files.add(file_key)  # 처리 완료 목록에 추가
+                    moved_file_keys.add(file_key)
+                
+            except Exception as e:
+                logger.error(f"❌ [{table_type}] 파일 이동 실패: {file_info.get('file_name', 'unknown')}, 오류: {e}")
+        
+        # stored_files에서 이동된 파일들만 제거
+        if moved_file_keys:
+            remaining_files = [
+                f for f in self.stored_files[table_type]
+                if f.get("file_key") not in moved_file_keys
+            ]
+            self.stored_files[table_type] = remaining_files
+            logger.debug(f"🔄 [{table_type}] stored_files에서 {len(moved_file_keys)}개 파일 제거, {len(remaining_files)}개 파일 남음")
+        
+        if moved_count > 0:
+            logger.info(f"✅ [{table_type}] {moved_count}개 파일을 imported 폴더로 이동 완료")
+        
+        return moved_count
 
-   
+####
+
+class ExcelImporter:
+    def __init__(self, notion_manager):
+        self.notion = notion_manager
+
+    async def get_date_range_from_notion(self, table_type: str, date_property: str) -> Optional[datetime]:
+        """노션 DB에서 마지막 날짜 조회
+        
+        Args:
+            table_type: 테이블 타입 (class, discharge, student)
+            date_property: 날짜 속성명 (start_date, discharge_date 등)
+        
+        Returns:
+            마지막 날짜 (datetime) 또는 None
+        """
+        try:
+            db_id = self.notion.db_map.get(table_type.lower())
+            if not db_id:
+                logger.error(f"❌ 테이블을 찾을 수 없음: {table_type}")
+                return None
+            
+            # 가장 최신 데이터만 조회
+            newest = await self.notion.client.databases.query(
+                database_id=db_id,
+                sorts=[{"property": date_property, "direction": "descending"}],
+                page_size=1
+            )
+            
+            if newest.get('results'):
+                date_value = self.notion._get_date(newest['results'][0], date_property)
+                if date_value:
+                    try:
+                        if "T" in date_value:
+                            return datetime.fromisoformat(date_value.split("T")[0])
+                        else:
+                            return datetime.fromisoformat(date_value)
+                    except Exception as e:
+                        logger.error(f"❌ 날짜 파싱 실패: {e}")
+                        return None
+            
+            return None
+        except Exception as e:
+            logger.error(f"❌ 노션 조회 실패: {e}")
+            return None
+
+    
+    def _convert_dataframe_row_to_notion_properties(self, row: pd.Series, table_type: str, df: pd.DataFrame) -> Dict[str, Any]:
+        """DataFrame 행을 Notion 속성 형식으로 변환
+        
+        Args:
+            row: DataFrame의 한 행
+            table_type: 테이블 타입 (class, discharge, student)
+            df: 전체 DataFrame (컬럼 정보 확인용)
+        
+        Returns:
+            Notion 속성 딕셔너리
+        """
+        properties = {}
+        
+        # 테이블 타입별 매핑
+        if table_type == "class":
+            # class 테이블 속성 매핑
+            if "학생명" in df.columns or "student_name" in df.columns:
+                col = "학생명" if "학생명" in df.columns else "student_name"
+                student_name = str(row[col]) if pd.notna(row[col]) else ""
+                properties["student_name"] = {"title": [{"text": {"content": student_name}}]}
+            
+            if "담당" in df.columns or "teacher_name" in df.columns:
+                col = "담당" if "담당" in df.columns else "teacher_name"
+                teacher_name = row[col]
+                if pd.notna(teacher_name):
+                    if isinstance(teacher_name, str):
+                        # 쉼표로 구분된 경우 리스트로 변환
+                        if "," in teacher_name:
+                            teacher_list = [t.strip() for t in teacher_name.split(",")]
+                            properties["teacher_name"] = {"multi_select": [{"name": str(t)} for t in teacher_list]}
+                        else:
+                            properties["teacher_name"] = {"rich_text": [{"text": {"content": str(teacher_name)}}]}
+                    elif isinstance(teacher_name, list):
+                        properties["teacher_name"] = {"multi_select": [{"name": str(t)} for t in teacher_name]}
+            
+            if "반명" in df.columns or "class_name" in df.columns:
+                col = "반명" if "반명" in df.columns else "class_name"
+                class_name = str(row[col]) if pd.notna(row[col]) else ""
+                properties["class_name"] = {"rich_text": [{"text": {"content": class_name}}]}
+            
+            if "부모HP" in df.columns or "parent_phone_number" in df.columns:
+                col = "부모HP" if "부모HP" in df.columns else "parent_phone_number"
+                phone = str(row[col]) if pd.notna(row[col]) else ""
+                properties["parent_phone_number"] = {"rich_text": [{"text": {"content": phone}}]}
+            
+            if "시작일" in df.columns or "start_date" in df.columns:
+                col = "시작일" if "시작일" in df.columns else "start_date"
+                date_value = row[col]
+                if pd.notna(date_value):
+                    try:
+                        if isinstance(date_value, datetime):
+                            date_obj = date_value
+                        elif isinstance(date_value, str):
+                            date_obj = pd.to_datetime(date_value)
+                        else:
+                            date_obj = pd.to_datetime(date_value)
+                        properties["start_date"] = {"date": {"start": date_obj.strftime("%Y-%m-%d")}}
+                    except:
+                        pass
+            
+            if "학교명" in df.columns or "school_name" in df.columns:
+                col = "학교명" if "학교명" in df.columns else "school_name"
+                school_name = str(row[col]) if pd.notna(row[col]) else ""
+                properties["school_name"] = {"rich_text": [{"text": {"content": school_name}}]}
+            
+            if "학년" in df.columns or "grade" in df.columns:
+                col = "학년" if "학년" in df.columns else "grade"
+                grade = row[col]
+                if pd.notna(grade):
+                    try:
+                        # "3학년" 형식에서 숫자만 추출
+                        if isinstance(grade, str):
+                            grade_num = re.search(r'\d+', grade)
+                            if grade_num:
+                                properties["grade"] = {"number": int(grade_num.group())}
+                        else:
+                            properties["grade"] = {"number": int(grade)}
+                    except:
+                        pass
+            
+            # type -> type (특목, 본관 구분)
+            if "type" in df.columns or "타입" in df.columns or "구분" in df.columns:
+                col = None
+                if "type" in df.columns:
+                    col = "type"
+                elif "타입" in df.columns:
+                    col = "타입"
+                elif "구분" in df.columns:
+                    col = "구분"
+                
+                if col and pd.notna(row[col]):
+                    type_value = str(row[col]).strip()
+                    if type_value:
+                        # rich_text 타입으로 처리 (특목, 본관)
+                        properties["type"] = {"rich_text": [{"text": {"content": type_value}}]}
+        
+        elif table_type == "discharge":
+            # discharge 테이블 속성 매핑 (지정된 컬럼명 사용)
+            # 시작일 -> start_date
+            if "시작일" in df.columns or "start_date" in df.columns:
+                col = "시작일" if "시작일" in df.columns else "start_date"
+                date_value = row[col]
+                if pd.notna(date_value):
+                    try:
+                        if isinstance(date_value, datetime):
+                            date_obj = date_value
+                        elif isinstance(date_value, str):
+                            date_obj = pd.to_datetime(date_value)
+                        else:
+                            date_obj = pd.to_datetime(date_value)
+                        properties["start_date"] = {"date": {"start": date_obj.strftime("%Y-%m-%d")}}
+                    except:
+                        pass
+            
+            # 학생명 -> student_name
+            if "학생명" in df.columns or "student_name" in df.columns:
+                col = "학생명" if "학생명" in df.columns else "student_name"
+                student_name = str(row[col]) if pd.notna(row[col]) else ""
+                properties["student_name"] = {"title": [{"text": {"content": student_name}}]}
+            
+            # 부모HP -> parent_phone_number
+            if "부모HP" in df.columns or "parent_phone_number" in df.columns:
+                col = "부모HP" if "부모HP" in df.columns else "parent_phone_number"
+                phone = str(row[col]) if pd.notna(row[col]) else ""
+                properties["parent_phone_number"] = {"rich_text": [{"text": {"content": phone}}]}
+            
+            # 반명 -> class_name
+            if "반명" in df.columns or "class_name" in df.columns:
+                col = "반명" if "반명" in df.columns else "class_name"
+                class_name = str(row[col]) if pd.notna(row[col]) else ""
+                properties["class_name"] = {"rich_text": [{"text": {"content": class_name}}]}
+            
+            # 담당 -> teacher_name
+            if "담당" in df.columns or "teacher_name" in df.columns:
+                col = "담당" if "담당" in df.columns else "teacher_name"
+                teacher_name = row[col]
+                if pd.notna(teacher_name):
+                    if isinstance(teacher_name, str):
+                        # 쉼표로 구분된 경우 리스트로 변환
+                        if "," in teacher_name:
+                            teacher_list = [t.strip() for t in teacher_name.split(",")]
+                            properties["teacher_name"] = {"multi_select": [{"name": str(t)} for t in teacher_list]}
+                        else:
+                            properties["teacher_name"] = {"rich_text": [{"text": {"content": str(teacher_name)}}]}
+                    elif isinstance(teacher_name, list):
+                        properties["teacher_name"] = {"multi_select": [{"name": str(t)} for t in teacher_name]}
+            
+            # 퇴원사유 -> discharging_reason
+            if "퇴원사유" in df.columns or "discharging_reason" in df.columns:
+                col = "퇴원사유" if "퇴원사유" in df.columns else "discharging_reason"
+                reason = str(row[col]) if pd.notna(row[col]) else ""
+                properties["discharging_reason"] = {"rich_text": [{"text": {"content": reason}}]}
+            
+            # 학교명 -> school_name
+            if "학교명" in df.columns or "school_name" in df.columns:
+                col = "학교명" if "학교명" in df.columns else "school_name"
+                school_name = str(row[col]) if pd.notna(row[col]) else ""
+                properties["school_name"] = {"rich_text": [{"text": {"content": school_name}}]}
+            
+            # 학년 -> grade
+            if "학년" in df.columns or "grade" in df.columns:
+                col = "학년" if "학년" in df.columns else "grade"
+                grade = row[col]
+                if pd.notna(grade):
+                    try:
+                        # "3학년" 형식에서 숫자만 추출
+                        if isinstance(grade, str):
+                            grade_num = re.search(r'\d+', grade)
+                            if grade_num:
+                                properties["grade"] = {"number": int(grade_num.group())}
+                        else:
+                            properties["grade"] = {"number": int(grade)}
+                    except:
+                        pass
+            
+            # 퇴원일자 -> discharge_date
+            if "퇴원일자" in df.columns or "discharge_date" in df.columns:
+                col = "퇴원일자" if "퇴원일자" in df.columns else "discharge_date"
+                date_value = row[col]
+                if pd.notna(date_value):
+                    try:
+                        if isinstance(date_value, datetime):
+                            date_obj = date_value
+                        elif isinstance(date_value, str):
+                            date_obj = pd.to_datetime(date_value)
+                        else:
+                            date_obj = pd.to_datetime(date_value)
+                        properties["discharge_date"] = {"date": {"start": date_obj.strftime("%Y-%m-%d")}}
+                    except:
+                        pass
+            
+            # type -> type (특목, 본관 구분)
+            if "type" in df.columns or "타입" in df.columns or "구분" in df.columns:
+                col = None
+                if "type" in df.columns:
+                    col = "type"
+                elif "타입" in df.columns:
+                    col = "타입"
+                elif "구분" in df.columns:
+                    col = "구분"
+                
+                if col and pd.notna(row[col]):
+                    type_value = str(row[col]).strip()
+                    if type_value:
+                        # rich_text 타입으로 처리 (특목, 본관)
+                        properties["type"] = {"rich_text": [{"text": {"content": type_value}}]}
+        
+        elif table_type == "student":
+            # student 테이블 속성 매핑 (필요한 속성 추가)
+            if "학생명" in df.columns or "student_name" in df.columns:
+                col = "학생명" if "학생명" in df.columns else "student_name"
+                student_name = str(row[col]) if pd.notna(row[col]) else ""
+                properties["student_name"] = {"title": [{"text": {"content": student_name}}]}
+            
+            # student 테이블의 다른 속성들도 필요에 따라 추가
+        
+        return properties
+    
+    async def add_preprocessed_data_to_notion(self, df: pd.DataFrame, table_type: str) -> int:
+        """전처리된 DataFrame을 Notion DB에 추가
+        
+        Args:
+            df: 전처리된 DataFrame
+            table_type: 테이블 타입 (class, discharge, student)
+        
+        Returns:
+            추가된 페이지 수
+        """
+        if df.empty:
+            logger.warning(f"⚠️ [{table_type}] 추가할 데이터가 없습니다.")
+            return 0
+        
+        db_id = self.notion.db_map.get(table_type.lower())
+        if not db_id:
+            logger.error(f"❌ 테이블을 찾을 수 없음: {table_type}")
+            return 0
+        
+        logger.info(f"📤 [{table_type}] Notion DB에 데이터 추가 시작: {len(df)}개 행")
+        
+        added_count = 0
+        failed_count = 0
+        
+        for idx, row in df.iterrows():
+            try:
+                # DataFrame 행을 Notion 속성으로 변환
+                properties = self._convert_dataframe_row_to_notion_properties(row, table_type, df)
+                
+                if not properties:
+                    logger.warning(f"⚠️ [{table_type}] 행 {idx}: 변환된 속성이 없어 건너뜁니다.")
+                    continue
+                
+                # Notion에 추가
+                await self.notion.client.pages.create(
+                    parent={"database_id": db_id},
+                    properties=properties
+                )
+                
+                added_count += 1
+                if added_count % 10 == 0:
+                    logger.info(f"📝 [{table_type}] 진행 중: {added_count}/{len(df)}개 추가됨")
+                
+                # API 제한 고려 (초당 3회)
+                await asyncio.sleep(0.35)
+                
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"❌ [{table_type}] 행 {idx} 추가 실패: {e}")
+        
+        logger.info(f"✅ [{table_type}] Notion DB 추가 완료: 성공 {added_count}개, 실패 {failed_count}개")
+        
+        return added_count
+
+
+    
+
 
 ####
 
@@ -1070,21 +2059,48 @@ class EnhancedDischargeReportGenerator:
                                 teacher_name: str, 
                                 year: int, 
                                 month: int) -> Dict:
-        """12개월 추이 데이터"""
-        trend_data = []
-        
-        # 과거 11개월 + 현재월 = 12개월
-        for i in range(11, -1, -1):
-            # i개월 전 계산
-            target_date = datetime(year, month, 1) - timedelta(days=i*30)
-            target_year = target_date.year
-            target_month = target_date.month
-            
-            start_date, end_date = self._get_month_range(
-                target_year, target_month
-            )
-            
-            # 해당 월 입퇴소 수
+        """가용 데이터 개월 수에 맞춘 월별 추이 데이터"""
+        trend_data: List[Dict[str, Any]] = []
+
+        # 1) 데이터에 존재하는 월 수집 (class: start_date, discharge: discharge_date)
+        months_set: set = set()
+
+        def _add_month(val):
+            if not val:
+                return
+            if isinstance(val, list):
+                for v in val:
+                    _add_month(v)
+                return
+            try:
+                d = datetime.fromisoformat(str(val).split("T")[0])
+                months_set.add((d.year, d.month))
+            except Exception:
+                return
+
+        if isinstance(query_results, dict):
+            normalized = {k.lower(): v for k, v in query_results.items()}
+            for item in normalized.get("class", []):
+                v = item.get("start_date") or item.get("start") or item.get("입소일") or item.get("startDate")
+                _add_month(v)
+            for item in normalized.get("discharge", []):
+                v = item.get("discharge_date") or item.get("discharge") or item.get("퇴소일") or item.get("dischargeDate")
+                _add_month(v)
+
+        # 2) 사용할 월 목록 결정
+        if months_set:
+            month_targets = sorted(months_set)  # (year, month) 오름차순
+        else:
+            # 데이터가 없으면 기존처럼 최근 12개월을 사용
+            month_targets = []
+            for i in range(11, -1, -1):
+                target_date = datetime(year, month, 1) - timedelta(days=i*30)
+                month_targets.append((target_date.year, target_date.month))
+
+        # 3) 월별 입소/퇴소 집계
+        for target_year, target_month in month_targets:
+            start_date, end_date = self._get_month_range(target_year, target_month)
+
             enrollments = await self.year_month_enrollment(
                 query_results, target_year, target_month
             )
@@ -1092,9 +2108,8 @@ class EnhancedDischargeReportGenerator:
                 query_results, target_year, target_month
             )
 
-            # debug 로그: 각 월별 조회 결과 수 확인
             logger.debug(f"[Trend] {target_year}-{target_month:02d} enrollments={len(enrollments)} discharges={len(discharges)}")
-            
+
             trend_data.append({
                 "year": target_year,
                 "month": target_month,
@@ -1103,8 +2118,14 @@ class EnhancedDischargeReportGenerator:
                 "discharges": len(discharges),
                 "net_change": len(enrollments) - len(discharges)
             })
-        
-        return {"monthly_data": trend_data}
+
+        # 4) 차트 타입 결정: 데이터가 한 개월뿐이면 막대형
+        chart_type = "bar" if len(trend_data) == 1 else "line"
+
+        return {
+            "monthly_data": trend_data,
+            "chart_type": chart_type
+        }
     
     async def _get_detailed_student_list(self, query_results
                                         ) -> List[Dict]:
@@ -1117,16 +2138,34 @@ class EnhancedDischargeReportGenerator:
         for student in enrollments:
             # enrollments now use internal English keys; map to output Korean keys
             start_val = student.get("start_date")
+            is_from_discharge = bool(student.get("_from_discharge"))
+            grade_value = student.get("grade")
+            grade_num = None
+            if isinstance(grade_value, int):
+                grade_num = grade_value
+            elif isinstance(grade_value, str):
+                match = re.search(r"\d+", grade_value)
+                if match:
+                    grade_num = int(match.group())
+            grade_label = f"{grade_num}학년" if grade_num is not None else grade_value
+            school_name = str(student.get("school_name") or "").strip()
+            class_name_text = str(student.get("class_name") or "")
+            if isinstance(student.get("class_name"), list):
+                class_name_text = ", ".join(student.get("class_name"))
+            if ("유아" in school_name or "유치" in school_name or "유아" in class_name_text or "유치" in class_name_text) and grade_num is not None:
+                grade_label = f"{grade_num}세"
             detailed_list.append({
                 "학생명": student.get("student_name"),
-                "학년": f"{student.get('grade')}학년" if isinstance(student.get('grade'), int) else student.get('grade'),
+                "학년": grade_label,
                 "반": student.get("class_name"),
+                "학교": student.get("school_name"),
                 "입소일자": start_val,
                 "퇴소일자": None,
-                "재원상태": "재원중",
-                "재원기간": self._calculate_days_from(start_val),
+                "재원상태": "퇴원" if is_from_discharge else "재원중",
+                "재원기간": "-" if is_from_discharge else self._calculate_days_from(start_val),
                 "퇴원사유": None,
-                "학부모전화": student.get("parent_phone_number")
+                "학부모전화": student.get("parent_phone_number"),
+                "_from_discharge": is_from_discharge
             })
         
         # 2. 퇴소 학생 (discharge 테이블 - 입소일 + 퇴소일 있음)
@@ -1135,10 +2174,26 @@ class EnhancedDischargeReportGenerator:
         for student in discharges:
             start_val = student.get("start_date")
             end_val = student.get("discharge_date")
+            grade_value = student.get("grade")
+            grade_num = None
+            if isinstance(grade_value, int):
+                grade_num = grade_value
+            elif isinstance(grade_value, str):
+                match = re.search(r"\d+", grade_value)
+                if match:
+                    grade_num = int(match.group())
+            grade_label = f"{grade_num}학년" if grade_num is not None else grade_value
+            school_name = str(student.get("school_name") or "").strip()
+            class_name_text = str(student.get("class_name") or "")
+            if isinstance(student.get("class_name"), list):
+                class_name_text = ", ".join(student.get("class_name"))
+            if ("유아" in school_name or "유치" in school_name or "유아" in class_name_text or "유치" in class_name_text) and grade_num is not None:
+                grade_label = f"{grade_num}세"
             detailed_list.append({
                 "학생명": student.get("student_name"),
-                "학년": f"{student.get('grade')}학년" if isinstance(student.get('grade'), int) else student.get('grade'),
+                "학년": grade_label,
                 "반": ", ".join(student.get("class_name", [])) if isinstance(student.get("class_name"), list) else student.get("class_name", ""),
+                "학교": student.get("school_name"),
                 "입소일자": start_val,
                 "퇴소일자": end_val,
                 "재원상태": "퇴원",
@@ -1147,7 +2202,8 @@ class EnhancedDischargeReportGenerator:
                     end_val
                 ),
                 "퇴원사유": student.get("discharging_reason"),
-                "학부모전화": student.get("parent_phone_number")
+                "학부모전화": student.get("parent_phone_number"),
+                "_from_discharge": False
         })
         
         # 퇴소일자 기준 정렬 (퇴소일자가 없으면 입소일자 사용)
@@ -1269,7 +2325,7 @@ class EnhancedDischargeReportGenerator:
         wb = openpyxl.Workbook()
         wb.remove(wb.active)
         
-        # ===== 시트 1: 12개월 추이 (차트 포함) =====
+        # ===== 시트 1: 월별 추이 (차트 포함) =====
         ws_trend = wb.create_sheet("월별 추이")
         self._create_trend_sheet_with_chart(ws_trend, report_data)
 
@@ -1291,21 +2347,42 @@ class EnhancedDischargeReportGenerator:
 
         
         
-        # 저장
-        output_path = Path("temp") / f"{filename}.xlsx"
+        # 저장 (동일 이름 충돌 방지)
+        output_dir = Path("temp")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{filename}.xlsx"
+        if output_path.exists():
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            counter = 1
+            while output_path.exists():
+                suffix = f"{timestamp}_{counter}"
+                output_path = output_dir / f"{filename}_{suffix}.xlsx"
+                counter += 1
         wb.save(output_path)
         
         logger.info(f"✅ 차트 포함 Excel 생성 완료: {output_path.name}")
         return output_path
     
     def _create_trend_sheet_with_chart(self, ws, report_data: Dict):
-        """12개월 추이 시트 + 차트"""
-        trend_data = report_data["yearly_trend"]["monthly_data"]
+        """월별 추이 시트 + 차트 (데이터 개월수 기반)"""
+        trend_info = report_data.get("yearly_trend", {})
+        trend_data = trend_info.get("monthly_data", [])
+        chart_type = trend_info.get("chart_type", "line")
+        if trend_data:
+            months = [(d["year"], d["month"]) for d in trend_data if "year" in d and "month" in d]
+            if months:
+                min_year, min_month = min(months)
+                max_year, max_month = max(months)
+                month_count = (max_year - min_year) * 12 + (max_month - min_month) + 1
+            else:
+                month_count = 0
+        else:
+            month_count = 0
         
         # 제목
         ws.merge_cells('A1:G1')
         title = ws['A1']
-        title.value = f"📈 {report_data['teacher_name']} - 12개월 입퇴소 추이"
+        title.value = f"📈 {report_data['teacher_name']} - {month_count}개월 입퇴소 추이"
         title.font = Font(size=16, bold=True, color="FFFFFF")
         title.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
         title.alignment = Alignment(horizontal="center", vertical="center")
@@ -1349,36 +2426,47 @@ class EnhancedDischargeReportGenerator:
         ws.column_dimensions['D'].width = 10
         
         # ===== 차트 생성 =====
-        # 꺾은선 차트 (입소/퇴소)
-        line_chart = LineChart()
-        line_chart.title = "월별 입퇴소 추이"
-        line_chart.style = 13
-        line_chart.y_axis.title = "인원 (명)"
-        line_chart.x_axis.title = "월"
-        line_chart.height = 12
-        line_chart.width = 24
-        
-        # 데이터 범위
-        data = Reference(ws, min_col=2, min_row=header_row, 
-                        max_row=header_row + len(trend_data), max_col=3)
-        cats = Reference(ws, min_col=1, min_row=header_row + 1, 
-                        max_row=header_row + len(trend_data))
-        
-        line_chart.add_data(data, titles_from_data=True)
-        line_chart.set_categories(cats)
-        # 색상 지정: series[0]=입소(초록), series[1]=퇴소(붉은)
-        try:
-            line_chart.series[0].graphicalProperties.line.solidFill = "00B050"
-            line_chart.series[1].graphicalProperties.line.solidFill = "FF0000"
-        except Exception:
-            pass
-        
-        # 데이터 레이블 표시
-        line_chart.dataLabels = DataLabelList()
-        line_chart.dataLabels.showVal = True
-        
-        # 차트 삽입 위치
-        ws.add_chart(line_chart, f"F3")
+        # 데이터 범위 (월, 입소, 퇴소)
+        data_ref = Reference(ws, min_col=2, min_row=header_row, 
+                             max_row=header_row + len(trend_data), max_col=3)
+        cats_ref = Reference(ws, min_col=1, min_row=header_row + 1, 
+                             max_row=header_row + len(trend_data))
+
+        if chart_type == "bar":
+            # 데이터가 한 개월뿐이면 막대형으로 표현
+            bar_chart_main = BarChart()
+            bar_chart_main.type = "col"
+            bar_chart_main.title = "월별 입퇴소"
+            bar_chart_main.y_axis.title = "인원 (명)"
+            bar_chart_main.x_axis.title = "월"
+            bar_chart_main.height = 12
+            bar_chart_main.width = 24
+            bar_chart_main.add_data(data_ref, titles_from_data=True)
+            bar_chart_main.set_categories(cats_ref)
+            bar_chart_main.dataLabels = DataLabelList()
+            bar_chart_main.dataLabels.showVal = True
+            ws.add_chart(bar_chart_main, f"F3")
+        else:
+            # 기본: 꺾은선 차트 (입소/퇴소)
+            line_chart = LineChart()
+            line_chart.title = "월별 입퇴소 추이"
+            line_chart.style = 13
+            line_chart.y_axis.title = "인원 (명)"
+            line_chart.x_axis.title = "월"
+            line_chart.height = 12
+            line_chart.width = 24
+            
+            line_chart.add_data(data_ref, titles_from_data=True)
+            line_chart.set_categories(cats_ref)
+            try:
+                line_chart.series[0].graphicalProperties.line.solidFill = "00B050"
+                line_chart.series[1].graphicalProperties.line.solidFill = "FF0000"
+            except Exception:
+                pass
+            
+            line_chart.dataLabels = DataLabelList()
+            line_chart.dataLabels.showVal = True
+            ws.add_chart(line_chart, f"F3")
         
         # 막대 차트 (순증감)
         bar_chart = BarChart()
@@ -1420,7 +2508,9 @@ class EnhancedDischargeReportGenerator:
                 subjects = [subject] if subject else ["기타"]
             
             for subj in subjects:
-                if student.get("재원상태") == "재원중":
+                if student.get("_from_discharge"):
+                    subject_enrollments[subj] += 1
+                elif student.get("재원상태") == "재원중":
                     subject_enrollments[subj] += 1
                 elif student.get("재원상태") == "퇴원":
                     subject_discharges[subj] += 1
@@ -1554,8 +2644,8 @@ class EnhancedDischargeReportGenerator:
         # detailed_list에서 퇴원한 학생들만 필터링
         detailed_list = report_data.get("detailed_list", [])
         discharged_students = [
-            student for student in detailed_list 
-            if student.get("재원상태") == "퇴원" and student.get("퇴소일자")
+            student for student in detailed_list
+            if student.get("재원상태") == "퇴원" and student.get("퇴소일자") and not student.get("_from_discharge")
         ]
         
         if not discharged_students:
@@ -1784,8 +2874,8 @@ class EnhancedDischargeReportGenerator:
         # detailed_list에서 퇴원한 학생들만 필터링
         detailed_list = report_data.get("detailed_list", [])
         discharged_students = [
-            student for student in detailed_list 
-            if student.get("재원상태") == "퇴원" and student.get("퇴소일자")
+            student for student in detailed_list
+            if student.get("재원상태") == "퇴원" and student.get("퇴소일자") and not student.get("_from_discharge")
         ]
         
         if not discharged_students:
@@ -2019,8 +3109,12 @@ class EnhancedDischargeReportGenerator:
             return
         
         # 입소 학생과 퇴소 학생으로 분리
-        enrolled_students = [s for s in detailed if s.get("재원상태") == "재원중"]
-        discharged_students = [s for s in detailed if s.get("재원상태") == "퇴원"]
+        enrolled_students = [
+            s for s in detailed if s.get("재원상태") == "재원중" or s.get("_from_discharge")
+        ]
+        discharged_students = [
+            s for s in detailed if s.get("재원상태") == "퇴원" and not s.get("_from_discharge")
+        ]
         
         # 퇴소 학생 재원기간 평균 계산
         discharged_durations = []
@@ -2073,7 +3167,7 @@ class EnhancedDischargeReportGenerator:
             # 퇴소 학생 섹션 제목
             ws.merge_cells(f'A{current_row}:{get_column_letter(discharged_cols)}{current_row}')
             section_title = ws[f'A{current_row}']
-            section_title.value = "📌 퇴소 학생"
+            section_title.value = "📌 퇴소 정보"
             section_title.font = Font(size=12, bold=True, color="FFFFFF")
             section_title.fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
             section_title.alignment = Alignment(horizontal="left")
@@ -2104,9 +3198,13 @@ class EnhancedDischargeReportGenerator:
                     cell.value = value if value is not None else "-"
                     cell.alignment = Alignment(horizontal="left")
                     
-                    # 재원상태 색상
+                    # 재원상태 색상 (값 기준)
                     if df_discharged.columns[col_num - 1] == "재원상태":
-                        cell.font = Font(color="FF0000", bold=True)
+                        status = str(value).strip()
+                        if status == "퇴원":
+                            cell.font = Font(color="FF0000", bold=True)
+                        elif status == "재원중":
+                            cell.font = Font(color="00B050", bold=True)
                     
                     # 스트라이프
                     if current_row % 2 == 0:
@@ -2122,7 +3220,7 @@ class EnhancedDischargeReportGenerator:
             enrolled_cols = len(df_enrolled.columns)
             ws.merge_cells(f'{get_column_letter(enrolled_start_col)}{3}:{get_column_letter(enrolled_start_col + enrolled_cols - 1)}{3}')
             section_title = ws[f'{get_column_letter(enrolled_start_col)}{3}']
-            section_title.value = "📌 입소 학생 (재원중)"
+            section_title.value = "📌 입소 정보 (재원중, 퇴원)"
             section_title.font = Font(size=12, bold=True, color="FFFFFF")
             section_title.fill = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
             section_title.alignment = Alignment(horizontal="left")
@@ -2153,9 +3251,13 @@ class EnhancedDischargeReportGenerator:
                     cell.value = value if value is not None else "-"
                     cell.alignment = Alignment(horizontal="left")
                     
-                    # 재원상태 색상
+                    # 재원상태 색상 (값 기준)
                     if df_enrolled.columns[col_num - 1] == "재원상태":
-                        cell.font = Font(color="00B050", bold=True)
+                        status = str(value).strip()
+                        if status == "퇴원":
+                            cell.font = Font(color="FF0000", bold=True)
+                        elif status == "재원중":
+                            cell.font = Font(color="00B050", bold=True)
                     
                     # 스트라이프
                     if data_row % 2 == 0:
@@ -2258,6 +3360,123 @@ class ReportOrchestrator:
         #self.security = SecurityManager()
         #self.file_manager = LocalFileManager()
     
+    def _merge_discharge_into_class(
+        self,
+        query_results: Dict[str, List[Dict]],
+        min_start_date: Optional[datetime] = None
+    ) -> Dict[str, List[Dict]]:
+        if not isinstance(query_results, dict):
+            return query_results
+
+        # Find actual keys (case-insensitive)
+        class_key = None
+        discharge_key = None
+        for key in query_results.keys():
+            if isinstance(key, str):
+                if key.lower() == "class":
+                    class_key = key
+                elif key.lower() == "discharge":
+                    discharge_key = key
+
+        class_list = query_results.get(class_key, []) if class_key else []
+        discharge_list = query_results.get(discharge_key, []) if discharge_key else []
+
+        if not isinstance(class_list, list):
+            class_list = []
+        if not isinstance(discharge_list, list):
+            discharge_list = []
+
+        if not discharge_list:
+            return query_results
+
+        def _norm_str(value: Any) -> str:
+            if value is None:
+                return ""
+            return str(value).strip().lower()
+
+        def _norm_grade(value: Any) -> Optional[int]:
+            if value is None:
+                return None
+            try:
+                if isinstance(value, (int, float)):
+                    return int(value)
+                if isinstance(value, str):
+                    match = re.search(r"\d+", value)
+                    if match:
+                        return int(match.group())
+                return None
+            except Exception:
+                return None
+
+        def _parse_date(value: Any) -> Optional[datetime]:
+            if value is None:
+                return None
+            try:
+                if isinstance(value, datetime):
+                    return value
+                value_str = str(value)
+                if "T" in value_str:
+                    value_str = value_str.split("T")[0]
+                return datetime.fromisoformat(value_str)
+            except Exception:
+                return None
+
+        existing_keys = set()
+        for row in class_list:
+            if not isinstance(row, dict):
+                continue
+            student_name = _norm_str(row.get("student_name"))
+            class_name = _norm_str(row.get("class_name"))
+            parent_phone = _norm_str(row.get("parent_phone_number"))
+            grade = _norm_grade(row.get("grade"))
+            start_date = _norm_str(row.get("start_date"))
+            if not student_name or not class_name or not parent_phone or grade is None or not start_date:
+                continue
+            existing_keys.add((student_name, class_name, grade, parent_phone, start_date))
+
+        added_count = 0
+        for row in discharge_list:
+            if not isinstance(row, dict):
+                continue
+            student_name = _norm_str(row.get("student_name"))
+            class_name = _norm_str(row.get("class_name"))
+            parent_phone = _norm_str(row.get("parent_phone_number"))
+            grade = _norm_grade(row.get("grade"))
+            start_date = _norm_str(row.get("start_date"))
+            if not student_name or not class_name or not parent_phone or grade is None or not start_date:
+                continue
+
+            if min_start_date:
+                parsed_start = _parse_date(row.get("start_date"))
+                if parsed_start and parsed_start < min_start_date:
+                    continue
+
+            key = (student_name, class_name, grade, parent_phone, start_date)
+            if key in existing_keys:
+                continue
+
+            class_list.append({
+                "student_name": row.get("student_name"),
+                "class_name": row.get("class_name"),
+                "grade": grade,
+                "parent_phone_number": row.get("parent_phone_number"),
+                "start_date": row.get("start_date"),
+                "_from_discharge": True,
+            })
+            existing_keys.add(key)
+            added_count += 1
+
+        if added_count:
+            logger.info(f"✅ discharge → class 보정 추가: {added_count}개")
+
+        # write back (ensure key exists)
+        if class_key:
+            query_results[class_key] = class_list
+        else:
+            query_results["class"] = class_list
+
+        return query_results
+    
     async def _process_discharge_report(self, query_results: Dict, query: ReportQuery):
         """입퇴소 보고서 (차트 포함)"""
         
@@ -2292,7 +3511,7 @@ class ReportOrchestrator:
         )
         
         # 차트 포함 Excel 생성
-        filename = f"discharge_chart_{teacher_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        filename = f"{teacher_name}_입퇴소보고서"
         excel_path = self.discharge_report.create_excel_with_chart(
             report_data, filename
         )
@@ -2313,6 +3532,28 @@ class ReportOrchestrator:
             
             # 2. 쿼리 실행 및 데이터 수집
             query_results = await self.notion.query_multiple_tables(query)
+
+            # 보고서 연도 기준으로 discharge -> class 보정 범위 설정
+            min_start_date = None
+            q0 = query[0] if isinstance(query, list) and query else query
+            if q0 and q0.date_range:
+                try:
+                    start_str = q0.date_range.get("start")
+                    end_str = q0.date_range.get("end")
+                    date_str = start_str or end_str
+                    if date_str:
+                        if "T" in date_str:
+                            date_obj = datetime.fromisoformat(date_str.split("T")[0])
+                        else:
+                            date_obj = datetime.fromisoformat(date_str)
+                        # 월 단위 요청을 고려해 start가 있으면 그대로 사용, 없으면 end의 월 첫날 사용
+                        if start_str:
+                            min_start_date = date_obj
+                        else:
+                            min_start_date = datetime(date_obj.year, date_obj.month, 1)
+                except Exception:
+                    min_start_date = None
+            query_results = self._merge_discharge_into_class(query_results, min_start_date=min_start_date)
             
             # 3. 보고서 생성 및 전달
             await self._process_discharge_report(query_results, query)
@@ -2329,57 +3570,105 @@ class ReportOrchestrator:
 
 ####
 
+@dataclass
+class DataImportRequest:
+    """데이터 입력 요청"""
+    table_type: str
+    dataframe: pd.DataFrame
+    file_infos: List[Dict[str, Any]] = field(default_factory=list)  # 처리할 파일 정보 목록
+    id: str = field(default_factory=lambda: f"data_import_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}")
+    _is_data_import: bool = True
+    _retry_count: int = 0
+
 class PollingSystem:
     def __init__(self):
         self.orchestrator = ReportOrchestrator()
         self.is_running = False
-        self.queue = asyncio.Queue()
+        self.queue = asyncio.PriorityQueue()  # 우선순위 큐로 변경
         self.processed_ids = set()  # 처리 중이거나 완료된 요청 ID 추적
         self.worker_tasks = []  # 여러 워커 태스크 저장
         self.polling_task = None
+        self.is_processing_report = False  # 보고서 생성 중 플래그
+        self.report_lock = asyncio.Lock()  # 보고서 생성 락
+        self._queue_order = 0  # 큐에 추가된 순서 (우선순위가 같을 때 비교용)
     
     async def _worker(self):
-        """큐에서 요청을 하나씩 꺼내서 처리하는 워커"""
+        """큐에서 요청을 하나씩 꺼내서 처리하는 워커 (우선순위 기반)"""
         logger.info("👷 워커 시작")
         while self.is_running:
             request = None
+            priority = None
             try:
-                # 큐에서 요청 가져오기 (타임아웃 1초)
+                # 큐에서 요청 가져오기 (타임아웃 1초, 우선순위 큐)
                 try:
-                    request = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                    priority, order, request = await asyncio.wait_for(self.queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
                     continue
                 
                 if request is None:
                     continue
                 
-                # 이미 처리 중이거나 완료된 요청은 건너뛰기
-                if request.id in self.processed_ids:
-                    logger.debug(f"⏭️ 이미 처리된 요청 건너뛰기: {request.id}")
-                    self.queue.task_done()
-                    continue
+   
                 
-                logger.info(f"📝 큐에서 요청 가져옴: {request.id} (큐 크기: {self.queue.qsize()})")
+                # 데이터 입력 작업인 경우 보고서 생성이 끝날 때까지 대기
+                is_data_import = getattr(request, '_is_data_import', False)
+                if is_data_import and self.is_processing_report:
+                    logger.info(f"⏳ 데이터 입력 대기 중: 보고서 생성 완료 대기... (요청 ID: {request.id})")
+                    # 보고서 생성이 끝날 때까지 대기
+                    while self.is_processing_report and self.is_running:
+                        await asyncio.sleep(0.5)
+                    logger.info(f"✅ 데이터 입력 시작: 보고서 생성 완료됨 (요청 ID: {request.id})")
+                
+                logger.info(f"📝 큐에서 요청 가져옴: {request.id} (우선순위: {priority}, 큐 크기: {self.queue.qsize()})")
                 
                 # 처리 시도
                 try:
-                    # 처리 시작 시 processed_ids에 추가 (중복 처리 방지)
-                    self.processed_ids.add(request.id)
-                    await self.orchestrator.process_request(request)
+                    # 보고서 생성 작업인 경우 플래그 설정
+                    if not is_data_import:
+                        async with self.report_lock:
+                            self.is_processing_report = True
+                            logger.info(f"📊 보고서 생성 시작: {request.id}")
+                    
+                    # 데이터 입력 작업 처리
+                    if is_data_import:
+                        await self._process_data_import(request)
+                    else:
+                        # 보고서 생성 작업 처리
+                        await self.orchestrator.process_request(request)
+                    
                     logger.info(f"✅ 요청 처리 완료: {request.id}")
+                    # 성공적으로 처리 완료 시 processed_ids에서 제거 (재처리 가능하도록, 메모리 관리)
+                    # 특정 요청 ID만 제거 (다른 요청들은 유지)
+                    if request.id in self.processed_ids:
+                        self.processed_ids.discard(request.id)
+                        logger.info(f"🗑️ processed_ids에서 제거: {request.id} (현재 processed_ids 크기: {len(self.processed_ids)})")
+                    else:
+                        logger.warning(f"⚠️ processed_ids에 없는 요청 ID: {request.id}")
                 except Exception as e:
                     logger.error(f"❌ 요청 처리 실패: {request.id}, 오류: {str(e)}")
                     # 처리 실패 시 processed_ids에서 제거하여 재시도 가능하도록
-                    self.processed_ids.discard(request.id)
+                    # 특정 요청 ID만 제거 (다른 요청들은 유지)
+                    if request.id in self.processed_ids:
+                        self.processed_ids.discard(request.id)
+                        logger.info(f"🗑️ 처리 실패로 processed_ids에서 제거: {request.id} (현재 processed_ids 크기: {len(self.processed_ids)})")
+                    else:
+                        logger.warning(f"⚠️ processed_ids에 없는 요청 ID (실패): {request.id}")
                     import traceback
                     logger.error(f"상세 오류:\n{traceback.format_exc()}")
                     # 실패한 요청을 다시 큐에 넣어 재시도 (무한 루프 방지를 위해 최대 3회)
                     retry_count = getattr(request, '_retry_count', 0)
                     if retry_count < 3:
                         request._retry_count = retry_count + 1
-                        await self.queue.put(request)
+                        # 재시도 시에도 순서 번호 증가
+                        self._queue_order += 1
+                        await self.queue.put((priority, self._queue_order, request))  # 우선순위 유지
                         logger.info(f"🔄 요청 재시도 큐에 추가: {request.id} (재시도 {retry_count + 1}/3)")
                 finally:
+                    # 보고서 생성 작업인 경우 플래그 해제
+                    if not is_data_import:
+                        async with self.report_lock:
+                            self.is_processing_report = False
+                            logger.info(f"📊 보고서 생성 완료: {request.id}")
                     # 큐 작업 완료 표시 (성공/실패 관계없이)
                     self.queue.task_done()
                     
@@ -2391,6 +3680,50 @@ class PollingSystem:
                     self.queue.task_done()
                 await asyncio.sleep(1)
     
+    async def _process_data_import(self, request: DataImportRequest):
+        """데이터 입력 작업 처리"""
+        logger.info(f"📤 [{request.table_type}] Notion DB에 데이터 추가 시작: {len(request.dataframe)}개 행")
+        
+        added_count = 0
+        failed_count = 0
+        
+        for idx, row in request.dataframe.iterrows():
+            try:
+                # DataFrame 행을 Notion 속성으로 변환
+                properties = excel_importer._convert_dataframe_row_to_notion_properties(
+                    row, request.table_type, request.dataframe
+                )
+                
+                if not properties:
+                    logger.warning(f"⚠️ [{request.table_type}] 행 {idx}: 변환된 속성이 없어 건너뜁니다.")
+                    continue
+                
+                # Notion에 추가
+                await self.orchestrator.notion.client.pages.create(
+                    parent={"database_id": self.orchestrator.notion.db_map[request.table_type]},
+                    properties=properties
+                )
+                
+                added_count += 1
+                if added_count % 10 == 0:
+                    logger.info(f"📝 [{request.table_type}] 진행 중: {added_count}/{len(request.dataframe)}개 추가됨")
+                
+                # API 제한 고려 (초당 3회)
+                await asyncio.sleep(0.35)
+                
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"❌ [{request.table_type}] 행 {idx} 추가 실패: {e}")
+        
+        logger.info(f"✅ [{request.table_type}] Notion DB 추가 완료: 성공 {added_count}개, 실패 {failed_count}개")
+        
+        # 처리된 파일을 imported 폴더로 이동 (해당 요청에 포함된 파일들만 이동)
+        if request.file_infos:
+            moved_count = excel_handler.move_specific_files_to_imported(request.table_type, request.file_infos)
+            logger.info(f"✅ [{request.table_type}] {moved_count}개 파일을 imported 폴더로 이동 완료")
+        else:
+            logger.warning(f"⚠️ [{request.table_type}] 이동할 파일 정보가 없습니다.")
+    
     async def _polling(self, interval: int = 30):
         """주기적으로 새로운 요청을 큐에 추가하는 폴링 태스크"""
         logger.info("🔍 폴링 시작")
@@ -2400,8 +3733,12 @@ class PollingSystem:
             initial_requests = await self.orchestrator.notion.get_pending_requests()
             for req in initial_requests:
                 if req.id not in self.processed_ids:
-                    await self.queue.put(req)
-                    logger.info(f"📥 초기 요청 큐에 추가: {req.id} (큐 크기: {self.queue.qsize()})")
+                    # 큐에 추가할 때 즉시 processed_ids에 추가 (중복 방지)
+                    self.processed_ids.add(req.id)
+                    # 보고서 생성 요청은 우선순위 2 (낮음)
+                    self._queue_order += 1
+                    await self.queue.put((2, self._queue_order, req))
+                    logger.info(f"📥 초기 요청 큐에 추가: {req.id} (우선순위: 2, 큐 크기: {self.queue.qsize()})")
             logger.info(f"✅ 초기 {len(initial_requests)}개 요청 큐에 추가 완료")
         except Exception as e:
             logger.error(f"❌ 초기 요청 로드 실패: {str(e)}")
@@ -2420,9 +3757,13 @@ class PollingSystem:
                 new_count = 0
                 for req in requests:
                     if req.id not in self.processed_ids:
-                        await self.queue.put(req)
+                        # 큐에 추가할 때 즉시 processed_ids에 추가 (중복 방지)
+                        self.processed_ids.add(req.id)
+                        # 보고서 생성 요청은 우선순위 2 (낮음)
+                        self._queue_order += 1
+                        await self.queue.put((2, self._queue_order, req))
                         new_count += 1
-                        logger.info(f"📥 새 요청 큐에 추가: {req.id} (큐 크기: {self.queue.qsize()})")
+                        logger.info(f"📥 새 요청 큐에 추가: {req.id} (우선순위: 2, 큐 크기: {self.queue.qsize()})")
                 
                 if new_count == 0:
                     logger.info(f"💤 새 요청 없음 (큐 크기: {self.queue.qsize()}) ({datetime.now().strftime('%H:%M:%S')})")
@@ -2474,10 +3815,93 @@ class PollingSystem:
 app = FastAPI(title="학원 보고서 시스템")
 polling = PollingSystem()
 
+# ExcelFileHandler 인스턴스 생성 (NotionManager 주입)
+notion_manager = NotionManager()
+excel_handler = ExcelFileHandler(notion_manager=notion_manager)
+excel_importer = ExcelImporter(notion_manager)
+
 @app.on_event("startup")
 async def startup():
-    """서버 시작 시 폴링 시작"""
+    """서버 시작 시 폴링 및 엑셀 파일 감시 시작"""
     asyncio.create_task(polling.start(interval=30))
+    asyncio.create_task(excel_file_watcher_worker())
+
+async def excel_file_watcher_worker():
+    """엑셀 파일 감시 및 자동 처리 백그라운드 워커
+    
+    10초마다 다음 작업을 자동으로 수행:
+    1. 새 엑셀 파일 감지 및 저장
+    2. 전처리 (합치기, 중복 제거, 필터링)
+    3. Notion DB에 추가
+    4. 처리된 파일을 imported 폴더로 이동
+    """
+    logger.info("📂 엑셀 파일 자동 처리 워커 시작")
+    
+    while True:
+        try:
+            # 1. 새 엑셀 파일 감지 및 저장
+            result = excel_handler.watch_and_store()
+            
+            # 각 폴더별로 처리
+            for table_type in ["class", "discharge"]:
+                if table_type in result and len(result[table_type]) > 0:
+                    try:
+                        logger.info(f"🔄 [{table_type}] 자동 처리 시작...")
+                        
+                        # 2. 전처리
+                        df = await excel_handler.preprocess_and_merge(table_type)
+                        
+                        if df is None or df.empty:
+                            logger.info(f"⚠️ [{table_type}] 전처리 후 데이터가 없지만 파일은 이동합니다.")
+                            # 데이터가 없어도 파일을 imported 폴더로 이동
+                            moved_count = excel_handler.move_processed_files_to_imported(table_type)
+                            logger.info(f"✅ [{table_type}] {moved_count}개 파일을 imported 폴더로 이동 완료")
+                            continue
+                        
+                        logger.info(f"✅ [{table_type}] 전처리 완료: {len(df)}개 행")
+                        
+                        # 3. 큐에 추가하기 전에 해당 테이블 타입의 파일들을 queued_files에 추가
+                        for file_info in excel_handler.stored_files[table_type]:
+                            file_key = file_info.get("file_key")
+                            if file_key:
+                                excel_handler.queued_files.add(file_key)
+                        
+                        # 4. 데이터 입력 작업을 우선순위 큐에 추가 (우선순위 1 = 높음)
+                        # 현재 stored_files에 있는 파일 정보를 복사 (처리 완료 후 이동하기 위해)
+                        current_file_infos = excel_handler.stored_files[table_type].copy()
+                        data_import_request = DataImportRequest(
+                            table_type=table_type,
+                            dataframe=df,
+                            file_infos=current_file_infos  # 파일 정보 포함
+                        )
+                        polling._queue_order += 1
+                        await polling.queue.put((1, polling._queue_order, data_import_request))  # 우선순위 1
+                        logger.info(f"📥 [{table_type}] 데이터 입력 작업 큐에 추가됨 (우선순위: 1, 큐 크기: {polling.queue.qsize()})")
+                        
+                        # 큐에 추가한 후 해당 파일들을 stored_files에서 제거 (처리 완료 후 이동하기 위해 요청에 포함됨)
+                        # 요청에 파일 정보가 포함되어 있으므로, 처리 완료 시 해당 파일들만 이동됨
+                        for file_info in current_file_infos:
+                            file_key = file_info.get("file_key")
+                            if file_key:
+                                # stored_files에서 해당 파일 제거
+                                excel_handler.stored_files[table_type] = [
+                                    f for f in excel_handler.stored_files[table_type]
+                                    if f.get("file_key") != file_key
+                                ]
+                        logger.debug(f"🔄 [{table_type}] 큐 추가 후 해당 파일들을 stored_files에서 제거 (요청에 포함됨)")
+                            
+                    except Exception as e:
+                        logger.error(f"❌ [{table_type}] 자동 처리 오류: {str(e)}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                        
+        except Exception as e:
+            logger.error(f"❌ 엑셀 파일 감시 오류: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+        
+        # 10초마다 스캔
+        await asyncio.sleep(10)
 
 @app.get("/")
 async def root():
@@ -2490,6 +3914,9 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+
 
 @app.get("/download/{date}/{filename}")
 async def download_file(date: str, filename: str):
@@ -2514,11 +3941,263 @@ async def webhook():
     added_count = 0
     for req in requests:
         if req.id not in polling.processed_ids:
-            await polling.queue.put(req)
-            # processed_ids에 추가하지 않음 - 워커에서 처리할 때 추가
+            # 보고서 생성 요청은 우선순위 2 (낮음)
+            polling._queue_order += 1
+            await polling.queue.put((2, polling._queue_order, req))
             added_count += 1
-            logger.info(f"📥 웹훅으로 새 요청 큐에 추가: {req.id} (큐 크기: {polling.queue.qsize()})")
+            logger.info(f"📥 웹훅으로 새 요청 큐에 추가: {req.id} (우선순위: 2, 큐 크기: {polling.queue.qsize()})")
     return {"status": "processing", "added_to_queue": added_count}
+
+@app.get("/excel/watch")
+async def watch_excel_files():
+    """input 폴더의 새 엑셀 파일을 감지하고 폴더별로 구별해서 저장"""
+    try:
+        result = excel_handler.watch_and_store()
+        
+        # 결과 요약 (폴더별)
+        summary = {}
+        data_by_folder = {}
+        
+        for folder_name, file_list in result.items():
+            summary[folder_name] = {
+                "file_count": len(file_list),
+                "total_rows": sum(file_info["rows"] for file_info in file_list)
+            }
+            
+            # 폴더별 파일 정보 (DataFrame 제외)
+            data_by_folder[folder_name] = [
+                {
+                    "file_name": file_info["file_name"],
+                    "file_path": file_info["file_path"],
+                    "folder": file_info["folder"],
+                    "rows": file_info["rows"],
+                    "columns": file_info["columns"],
+                    "read_time": file_info["read_time"]
+                }
+                for file_info in file_list
+            ]
+        
+        return {
+            "status": "success",
+            "summary": summary,
+            "data_by_folder": data_by_folder
+        }
+    except Exception as e:
+        logger.error(f"❌ 엑셀 파일 감시 오류: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/excel/stored")
+async def get_stored_files(table_type: Optional[str] = None):
+    """저장된 엑셀 파일 정보 조회 (폴더별로 구별)"""
+    try:
+        result = excel_handler.get_stored_files(table_type)
+        
+        # 결과 요약
+        summary = {}
+        data_by_folder = {}
+        
+        for folder_name, file_list in result.items():
+            summary[folder_name] = {
+                "file_count": len(file_list),
+                "total_rows": sum(file_info["rows"] for file_info in file_list)
+            }
+            
+            # 폴더별 파일 정보 (DataFrame 제외)
+            data_by_folder[folder_name] = [
+                {
+                    "file_name": file_info["file_name"],
+                    "file_path": file_info["file_path"],
+                    "folder": file_info["folder"],
+                    "rows": file_info["rows"],
+                    "columns": file_info["columns"],
+                    "read_time": file_info["read_time"]
+                }
+                for file_info in file_list
+            ]
+        
+        return {
+            "status": "success",
+            "summary": summary,
+            "data_by_folder": data_by_folder
+        }
+    except Exception as e:
+        logger.error(f"❌ 저장된 파일 조회 오류: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/excel/clear")
+async def clear_stored_files(table_type: Optional[str] = None):
+    """저장된 파일 정보 초기화"""
+    excel_handler.clear_stored_files(table_type)
+    return {
+        "status": "success",
+        "message": f"{table_type if table_type else '모든'} 폴더의 저장된 파일 정보가 초기화되었습니다."
+    }
+
+@app.post("/excel/reset")
+async def reset_excel_handler():
+    """처리된 파일 목록 초기화 (모든 파일을 다시 읽을 수 있도록)"""
+    excel_handler.reset_processed_files()
+    return {"status": "success", "message": "처리된 파일 목록이 초기화되었습니다."}
+
+@app.post("/excel/preprocess/{table_type}")
+async def preprocess_excel_files(table_type: str):
+    """저장된 엑셀 파일들을 합치고 중복 제거 및 날짜 필터링 (전처리)
+    
+    Args:
+        table_type: 테이블 타입 (class, discharge, student)
+    """
+    try:
+        df = await excel_handler.preprocess_and_merge(table_type)
+        
+        if df is None:
+            return {
+                "status": "error",
+                "message": f"{table_type} 폴더에 처리할 파일이 없습니다."
+            }
+        
+        return {
+            "status": "success",
+            "table_type": table_type,
+            "rows": len(df),
+            "columns": list(df.columns),
+            "message": f"{table_type} 폴더의 {len(excel_handler.stored_files[table_type])}개 파일을 합쳐서 {len(df)}개 행으로 전처리 완료"
+        }
+    except Exception as e:
+        logger.error(f"❌ 전처리 오류: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/excel/import/{table_type}")
+async def import_excel_to_notion(table_type: str):
+    """전처리된 엑셀 파일을 Notion에 추가하고 처리된 파일을 imported 폴더로 이동
+    
+    Args:
+        table_type: 테이블 타입 (class, discharge, student)
+    """
+    try:
+        # 1. 전처리
+        logger.info(f"🔄 [{table_type}] 전처리 시작...")
+        df = await excel_handler.preprocess_and_merge(table_type)
+        
+        if df is None or df.empty:
+            return {
+                "status": "error",
+                "message": f"{table_type} 폴더에 처리할 파일이 없거나 전처리 후 데이터가 없습니다."
+            }
+        
+        logger.info(f"✅ [{table_type}] 전처리 완료: {len(df)}개 행")
+        
+        # 2. Notion에 추가
+        logger.info(f"📤 [{table_type}] Notion DB에 추가 시작...")
+        added_count = await excel_importer.add_preprocessed_data_to_notion(df, table_type)
+        
+        if added_count == 0:
+            return {
+                "status": "error",
+                "message": f"{table_type} 데이터를 Notion에 추가하지 못했습니다."
+            }
+        
+        logger.info(f"✅ [{table_type}] Notion DB에 {added_count}개 추가 완료")
+        
+        # 3. 처리된 파일을 imported 폴더로 이동
+        logger.info(f"📦 [{table_type}] 처리된 파일을 imported 폴더로 이동 시작...")
+        moved_count = excel_handler.move_processed_files_to_imported(table_type)
+        
+        logger.info(f"✅ [{table_type}] {moved_count}개 파일을 imported 폴더로 이동 완료")
+        
+        return {
+            "status": "success",
+            "table_type": table_type,
+            "preprocessed_rows": len(df),
+            "notion_added": added_count,
+            "files_moved": moved_count,
+            "message": f"{table_type} 처리 완료: {added_count}개 데이터 Notion 추가, {moved_count}개 파일 이동"
+        }
+    except Exception as e:
+        logger.error(f"❌ [{table_type}] import 오류: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {"status": "error", "message": str(e)}
+
+@app.post("/excel/import-all")
+async def import_all_excel_to_notion():
+    """모든 폴더의 전처리된 엑셀 파일을 Notion에 추가하고 처리된 파일을 imported 폴더로 이동"""
+    try:
+        result = {}
+        
+        for table_type in ["class", "discharge", "student"]:
+            try:
+                # 1. 전처리
+                logger.info(f"🔄 [{table_type}] 전처리 시작...")
+                df = await excel_handler.preprocess_and_merge(table_type)
+                
+                if df is None or df.empty:
+                    result[table_type] = {
+                        "status": "skipped",
+                        "message": "처리할 파일이 없거나 전처리 후 데이터가 없습니다."
+                    }
+                    continue
+                
+                logger.info(f"✅ [{table_type}] 전처리 완료: {len(df)}개 행")
+                
+                # 2. Notion에 추가
+                logger.info(f"📤 [{table_type}] Notion DB에 추가 시작...")
+                added_count = await excel_importer.add_preprocessed_data_to_notion(df, table_type)
+                
+                # 3. 처리된 파일을 imported 폴더로 이동
+                logger.info(f"📦 [{table_type}] 처리된 파일을 imported 폴더로 이동 시작...")
+                moved_count = excel_handler.move_processed_files_to_imported(table_type)
+                
+                result[table_type] = {
+                    "status": "success",
+                    "preprocessed_rows": len(df),
+                    "notion_added": added_count,
+                    "files_moved": moved_count
+                }
+                
+            except Exception as e:
+                logger.error(f"❌ [{table_type}] 처리 오류: {str(e)}")
+                result[table_type] = {
+                    "status": "error",
+                    "message": str(e)
+                }
+        
+        return {
+            "status": "success",
+            "results": result
+        }
+    except Exception as e:
+        logger.error(f"❌ 전체 import 오류: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {"status": "error", "message": str(e)}
+
+@app.post("/excel/preprocess-all")
+async def preprocess_all_excel_files():
+    """모든 폴더의 저장된 엑셀 파일들을 전처리 (합치기 + 중복 제거 + 날짜 필터링)"""
+    try:
+        result = await excel_handler.preprocess_all_folders()
+        
+        summary = {}
+        for table_type, df in result.items():
+            if df is not None:
+                summary[table_type] = {
+                    "rows": len(df),
+                    "columns": list(df.columns),
+                    "file_count": len(excel_handler.stored_files[table_type])
+                }
+            else:
+                summary[table_type] = {
+                    "rows": 0,
+                    "message": "처리할 파일이 없습니다."
+                }
+        
+        return {
+            "status": "success",
+            "summary": summary
+        }
+    except Exception as e:
+        logger.error(f"❌ 전처리 오류: {str(e)}")
+        return {"status": "error", "message": str(e)}
 
 
 ####
